@@ -30,6 +30,10 @@ CLAUDE.local.md
 
 node_modules/
 
+# Prisma generated client (build artifact, regenerated via `npm run db:generate`)
+
+generated/
+
 # Build output
 
 dist/

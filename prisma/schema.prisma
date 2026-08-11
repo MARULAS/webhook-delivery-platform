@@ -1,0 +1,12 @@
+// Part 1 deliberately defines no models. Domain models are introduced in
+// later parts, each with its own migration (see IMPLEMENTATION_PLAN.md
+// section 2, "Schema evolution across parts").
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
