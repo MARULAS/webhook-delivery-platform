@@ -10,8 +10,10 @@
     "dev": "node --env-file-if-exists=.env --watch src/index.ts",
     "start": "node --env-file-if-exists=.env src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --env-file-if-exists=.env --test",
-    "db:generate": "node --env-file-if-exists=.env node_modules/.bin/prisma generate"
+    "test": "node --env-file-if-exists=.env --test --test-concurrency=1",
+    "db:generate": "node --env-file-if-exists=.env node_modules/.bin/prisma generate",
+    "db:migrate": "node --env-file-if-exists=.env node_modules/.bin/prisma migrate dev",
+    "db:seed": "node --env-file-if-exists=.env prisma/seed.ts"
   },
   "dependencies": {
     "@fastify/swagger": "9.8.1",

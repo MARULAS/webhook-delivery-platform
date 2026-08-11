@@ -1,6 +1,8 @@
-// Part 1 deliberately defines no models. Domain models are introduced in
-// later parts, each with its own migration (see IMPLEMENTATION_PLAN.md
-// section 2, "Schema evolution across parts").
+// Part 2 added endpoints, event types, and subscriptions; Part 3 adds events
+// and deliveries. Delivery attempts, the claim/lease columns, and the retry
+// columns belong to later parts and each arrives with its own migration (see
+// IMPLEMENTATION_PLAN.md section 2, "Schema evolution across parts"). Nothing
+// here is added before the part that actually reads or writes it.
 
 generator client {
   provider = "prisma-client"
@@ -9,4 +11,120 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+// D1 (IMPLEMENTATION_PLAN.md section 3): event types are a small persisted,
+// seeded catalog (see prisma/seed.ts) rather than a public CRUD resource.
+// Persisting them gives foreign-key integrity for subscriptions and makes
+// the unique (endpoint, eventType) constraint below expressible in the
+// database instead of only in application code.
+model EventType {
+  id            String         @id @default(uuid())
+  name          String         @unique
+  createdAt     DateTime       @default(now())
+  subscriptions Subscription[]
+  events        Event[]
+}
+
+model WebhookEndpoint {
+  id            String         @id @default(uuid())
+  name          String
+  url           String
+  // CSPRNG-generated at creation (crypto.randomBytes), never returned by any
+  // API response and never selected by a query that feeds a response.
+  signingSecret String
+  enabled       Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  subscriptions Subscription[]
+  deliveries    Delivery[]
+}
+
+// Deleting a WebhookEndpoint cascades to its Subscriptions: a subscription
+// without its endpoint is meaningless, so onDelete: Cascade on the endpoint
+// relation is the single, consistent rule for what happens to them.
+model Subscription {
+  id          String   @id @default(uuid())
+  endpointId  String
+  eventTypeId String
+  createdAt   DateTime @default(now())
+
+  endpoint  WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  eventType EventType       @relation(fields: [eventTypeId], references: [id])
+
+  // Database-enforced: a duplicate (endpoint, eventType) subscription must
+  // fail at the constraint, not only at an application-level pre-check.
+  @@unique([endpointId, eventTypeId])
+}
+
+// An event published to the platform (SPEC.md section 6). The payload is
+// persisted before any delivery is attempted; the worker reads it from here,
+// never from the request.
+model Event {
+  id             String   @id @default(uuid())
+  eventTypeId    String
+  payload        Json
+  // D2 (IMPLEMENTATION_PLAN.md section 3): the caller-supplied
+  // `Idempotency-Key`, unique across events when present. PostgreSQL treats
+  // NULLs as distinct in a unique index, so a plain @unique on a nullable
+  // column is behaviourally identical to the partial unique index
+  // `WHERE "idempotencyKey" IS NOT NULL` that D2 names — unlimited rows may
+  // omit the key, and at most one row may hold any given key — while staying
+  // expressible in Prisma without schema/migration drift.
+  idempotencyKey String?  @unique
+  // SHA-256 of the canonically serialized {type, payload} of the publishing
+  // request, written only when an idempotency key is present. D2 has to tell
+  // a replay of the same request from a reuse of the key for a materially
+  // different one; comparing this fingerprint is more robust than deep-
+  // comparing a jsonb round-trip, whose key order and number formatting are
+  // not guaranteed to match the original request bytes.
+  requestHash    String?
+  createdAt      DateTime @default(now())
+
+  eventType  EventType  @relation(fields: [eventTypeId], references: [id])
+  deliveries Delivery[]
+}
+
+// All five states from SPEC.md section 6 are defined here, at the point the
+// enum is created, because the value set is specified rather than inferred
+// (IMPLEMENTATION_PLAN.md section 2, the one deliberate exception to
+// migrating only what the current part uses). Part 3 only ever writes
+// PENDING; the remaining transitions arrive with the worker in Parts 4-5.
+enum DeliveryState {
+  PENDING
+  PROCESSING
+  RETRY_SCHEDULED
+  DELIVERED
+  FAILED
+}
+
+// The intended delivery of one event to one endpoint (SPEC.md section 6).
+// Attempt counts, next retry time, and the claim/lease columns are not here
+// yet: they belong to the parts that introduce the worker and retries.
+model Delivery {
+  id         String        @id @default(uuid())
+  eventId    String
+  endpointId String
+  state      DeliveryState @default(PENDING)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  // Both parents cascade. An event's deliveries are meaningless without the
+  // event, and deleting an endpoint already cascades to its subscriptions
+  // (the documented Part 2 rule); restricting instead would make an endpoint
+  // undeletable as soon as it had one delivery, silently breaking that rule.
+  event    Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  // Database-enforced: one event produces at most one delivery per endpoint.
+  // If publication were ever retried or raced, a duplicate fan-out would send
+  // the same webhook twice, so the invariant belongs in PostgreSQL and not
+  // only in the fan-out code. Its leading column also serves the
+  // "deliveries of this event" read below, so no separate eventId index.
+  @@unique([eventId, endpointId])
+  // Justified by endpoint deletion: the cascade above makes PostgreSQL look
+  // up referencing deliveries by endpointId, which would otherwise be a
+  // sequential scan of a table that only grows. Worker-facing indexes (state,
+  // nextAttemptAt) are deliberately absent until the parts that query them.
+  @@index([endpointId])
 }

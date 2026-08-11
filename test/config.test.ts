@@ -35,4 +35,22 @@ test("loadConfig applies documented defaults when optional variables are absent"
   assert.equal(config.port, 3000);
   assert.equal(config.logLevel, "info");
   assert.equal(config.nodeEnv, "development");
+  assert.equal(config.allowLocalEndpoints, false);
+});
+
+test("loadConfig accepts ALLOW_LOCAL_ENDPOINTS=true outside production", () => {
+  const config = loadConfig({ ...validEnv, NODE_ENV: "development", ALLOW_LOCAL_ENDPOINTS: "true" });
+  assert.equal(config.allowLocalEndpoints, true);
+});
+
+test("loadConfig fails closed: ALLOW_LOCAL_ENDPOINTS=true is rejected under NODE_ENV=production", () => {
+  assert.throws(
+    () => loadConfig({ ...validEnv, NODE_ENV: "production", ALLOW_LOCAL_ENDPOINTS: "true" }),
+    ConfigError,
+  );
+});
+
+test("loadConfig accepts ALLOW_LOCAL_ENDPOINTS=false under NODE_ENV=production", () => {
+  const config = loadConfig({ ...validEnv, NODE_ENV: "production", ALLOW_LOCAL_ENDPOINTS: "false" });
+  assert.equal(config.allowLocalEndpoints, false);
 });

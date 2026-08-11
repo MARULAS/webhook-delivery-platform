@@ -307,6 +307,11 @@ outbound concurrency.
   neither crashes the worker nor blocks other deliveries.
 - No secret, signature, or full payload appears in any log line or attempt record.
 - A delivery whose endpoint URL has become unsafe is rejected before the request.
+- A delivery whose endpoint has been disabled since the event was published is
+  not sent. Part 3 matches subscriptions against `enabled` at publication time,
+  but an endpoint may be disabled at any point in the unbounded gap before the
+  worker reaches the delivery, so the state is re-checked immediately before
+  the request rather than trusted from fan-out.
 
 **High-risk areas.** The highest-risk part in the project. The claim query must be
 genuinely atomic. The lease must not be shorter than the timeout, or live

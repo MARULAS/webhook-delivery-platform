@@ -17,6 +17,7 @@ export interface AppConfig {
   readonly port: number;
   readonly logLevel: string;
   readonly nodeEnv: NodeEnv;
+  readonly allowLocalEndpoints: boolean;
 }
 
 export class ConfigError extends Error {
@@ -88,6 +89,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     }
   }
 
+  // D5 (IMPLEMENTATION_PLAN.md section 3): a single, explicit, development-only
+  // flag that lets the URL safety module (src/infrastructure/security/url-safety.ts)
+  // accept loopback destinations for the local test receiver. Fail closed: a
+  // true value is rejected outright at config load when NODE_ENV=production,
+  // rather than silently downgraded to false, so a production misconfiguration
+  // is a startup failure, not a silent security gap. The URL safety module also
+  // never consults this flag when nodeEnv is "production", as a second,
+  // independent guard.
+  let allowLocalEndpoints = false;
+  const rawAllowLocalEndpoints = env.ALLOW_LOCAL_ENDPOINTS;
+  if (rawAllowLocalEndpoints !== undefined && rawAllowLocalEndpoints !== "") {
+    if (rawAllowLocalEndpoints !== "true" && rawAllowLocalEndpoints !== "false") {
+      problems.push(
+        `ALLOW_LOCAL_ENDPOINTS must be "true" or "false", got "${rawAllowLocalEndpoints}".`,
+      );
+    } else {
+      allowLocalEndpoints = rawAllowLocalEndpoints === "true";
+    }
+  }
+
+  if (allowLocalEndpoints && nodeEnv === "production") {
+    problems.push("ALLOW_LOCAL_ENDPOINTS must not be true when NODE_ENV=production.");
+  }
+
   if (problems.length > 0) {
     throw new ConfigError(`Invalid configuration:\n${problems.map((p) => `  - ${p}`).join("\n")}`);
   }
@@ -97,6 +122,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     port,
     logLevel,
     nodeEnv,
+    allowLocalEndpoints,
   });
 }
 
