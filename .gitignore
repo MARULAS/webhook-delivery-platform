@@ -1,4 +1,3 @@
-docs/
 
 # macOS
 
@@ -16,7 +15,7 @@ docs/
 .claude/
 CLAUDE.local.md
 .claude.local/
-
+docs/
 # Other local AI tooling
 
 .cursor/
