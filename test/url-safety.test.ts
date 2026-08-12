@@ -79,6 +79,47 @@ const cases: Case[] = [
 
   // A private range does not become a domain name just because it isn't 127/8
   { url: "http://172.32.0.1/hook", config: dev, allowed: true },
+
+  // RFC 6598 shared address space (100.64.0.0/10), including both edges of
+  // the range. 100.63.x and 100.128.x sit outside it and stay allowed, so the
+  // mask is not silently over-broad.
+  { url: "http://100.64.0.1/hook", config: dev, allowed: false },
+  { url: "http://100.127.255.254/hook", config: dev, allowed: false },
+  { url: "https://100.64.0.1/hook", config: prod, allowed: false },
+  { url: "http://100.63.255.255/hook", config: dev, allowed: true },
+  { url: "http://100.128.0.1/hook", config: dev, allowed: true },
+
+  // Oracle Cloud instance metadata, which falls outside the link-local range
+  // that already covers 169.254.169.254. Neighbouring addresses in 192.0.0/24
+  // are not part of this rule.
+  { url: "http://192.0.0.192/hook", config: dev, allowed: false },
+  { url: "https://192.0.0.192/hook", config: prod, allowed: false },
+  { url: "http://192.0.0.191/hook", config: dev, allowed: true },
+
+  // NAT64 well-known prefix (64:ff9b::/96): the embedded IPv4 address must be
+  // classified by the IPv4 rules, not treated as an ordinary public IPv6 host.
+  // a9fe:a9fe is 169.254.169.254, the cloud metadata address.
+  { url: "http://[64:ff9b::a9fe:a9fe]/hook", config: dev, allowed: false },
+  { url: "http://[64:ff9b::169.254.169.254]/hook", config: dev, allowed: false },
+  { url: "https://[64:ff9b::a9fe:a9fe]/hook", config: prod, allowed: false },
+  { url: "http://[64:ff9b::7f00:1]/hook", config: dev, allowed: false }, // 127.0.0.1
+  { url: "http://[64:ff9b::a00:5]/hook", config: dev, allowed: false }, // 10.0.0.5
+  { url: "http://[64:ff9b::6440:1]/hook", config: dev, allowed: false }, // 100.64.0.1
+  // D5 keys off the resolved category, not the spelling, so a NAT64-embedded
+  // loopback is exempted in development exactly as 127.0.0.1 and
+  // ::ffff:127.0.0.1 already are — unchanged behavior, and never production.
+  // A NAT64-embedded private range is still never exempted.
+  { url: "http://[64:ff9b::7f00:1]/hook", config: devWithLocal, allowed: true },
+  { url: "http://[64:ff9b::a00:5]/hook", config: devWithLocal, allowed: false },
+  { url: "http://[64:ff9b::a9fe:a9fe]/hook", config: devWithLocal, allowed: false },
+  // A NAT64-embedded public address is still a public destination.
+  { url: "http://[64:ff9b::808:808]/hook", config: dev, allowed: true }, // 8.8.8.8
+
+  // Regression: the existing ::ffff: IPv4-mapped handling still works after
+  // the NAT64 branch was added alongside it.
+  { url: "http://[::ffff:127.0.0.1]/hook", config: dev, allowed: false },
+  { url: "http://[::ffff:169.254.169.254]/hook", config: dev, allowed: false },
+  { url: "http://[::ffff:8.8.8.8]/hook", config: dev, allowed: true },
 ];
 
 for (const { url, config, allowed } of cases) {

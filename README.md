@@ -167,23 +167,48 @@ src/
 │   ├── endpoints/       webhook endpoint CRUD (routes, schemas, service)
 │   ├── subscriptions/   endpoint-to-event-type subscriptions
 │   ├── events/          event publication, idempotency, delivery fan-out
-│   └── deliveries/      delivery reads (the worker owns the write side)
+│   └── deliveries/      delivery reads and delivery state transitions
+├── worker/              delivery loop, atomic claiming, per-delivery execution
 ├── infrastructure/
 │   ├── database/        Prisma client
+│   ├── http/            outbound webhook client (timeout, no hidden retries)
 │   ├── logging/          structured logging
-│   └── security/         centralized outbound URL safety (SSRF protection)
+│   └── security/         outbound URL safety (SSRF) and HMAC-SHA256 signing
 └── shared/errors/       shared application error model and Fastify error handler
 prisma/                  schema.prisma, migrations/, seed.ts (event type catalog)
 test/                    node:test suite (unit + integration)
 ```
 
+## Webhook requests
+
+Each outbound request is a `POST` with a JSON body and two signing headers:
+
+```text
+X-Webhook-Timestamp: <unix time in whole seconds>
+X-Webhook-Signature: sha256=<hex HMAC-SHA256>
+```
+
+The signature is `HMAC-SHA256(endpoint signing secret, "<timestamp>." + <raw body bytes>)`.
+Verify it against the raw request body, before parsing, using a constant-time
+comparison, and reject requests whose timestamp is outside a tolerance window
+you consider acceptable. Redirects are never followed, and the body is:
+
+```json
+{ "deliveryId": "…", "eventId": "…", "type": "order.completed",
+  "createdAt": "…", "payload": { } }
+```
+
 ## Known limitations at this stage
 
-Delivery attempts, the background worker, HMAC signing, retries, manual
-retry, delivery history filters, and metrics are not implemented yet:
-deliveries are created and stay in `PENDING`, and no webhook is sent. The
-URL safety module validates the literal host given in a URL; it does not
-perform DNS resolution, so DNS rebinding between validation and a future
-delivery attempt is a known, accepted risk for this project's scope (see
+Retries, lease recovery, manual retry, delivery history filters, and metrics
+are not implemented yet. A delivery that fails for any reason currently goes
+straight to `FAILED` rather than being retried, and a delivery interrupted
+mid-flight stays in `PROCESSING` until Part 5 adds the lease recovery sweep.
+Delivery is at-least-once by design, so receivers should deduplicate on
+`deliveryId`.
+
+The URL safety module validates the literal host given in a URL; it does not
+perform DNS resolution, so DNS rebinding between validation and the delivery
+attempt is a known, accepted risk for this project's scope (see
 `src/infrastructure/security/url-safety.ts`). These are addressed in later
 implementation parts per `docs/IMPLEMENTATION_PLAN.md`.

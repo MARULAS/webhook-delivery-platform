@@ -24,6 +24,7 @@ export function createTestPrisma(config: AppConfig = testConfig()): PrismaClient
  * into it, so tests do not depend on prisma/seed.ts having been run.
  */
 export async function resetDatabase(prisma: PrismaClient): Promise<void> {
+  await prisma.deliveryAttempt.deleteMany();
   await prisma.delivery.deleteMany();
   await prisma.event.deleteMany();
   await prisma.subscription.deleteMany();

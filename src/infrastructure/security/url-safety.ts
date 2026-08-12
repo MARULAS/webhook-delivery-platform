@@ -24,7 +24,15 @@ export interface UrlSafetyConfig {
   readonly allowLocalEndpoints: boolean;
 }
 
-type HostCategory = "loopback" | "private" | "link-local" | "unspecified" | "localhost" | "malformed" | null;
+type HostCategory =
+  | "loopback"
+  | "private"
+  | "link-local"
+  | "unspecified"
+  | "localhost"
+  | "metadata"
+  | "malformed"
+  | null;
 
 const LOCALHOST_NAMES = new Set(["localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"]);
 
@@ -51,13 +59,21 @@ function parseIPv4(hostname: string): [number, number, number, number] | null {
 }
 
 function classifyIPv4(octets: [number, number, number, number]): HostCategory {
-  const [a, b] = octets;
+  const [a, b, c, d] = octets;
   if (a === 127) return "loopback";
   if (a === 0) return "unspecified"; // covers 0.0.0.0 and the rest of the reserved 0.0.0.0/8 block
   if (a === 10) return "private";
   if (a === 172 && b >= 16 && b <= 31) return "private";
   if (a === 192 && b === 168) return "private";
+  // RFC 6598 shared address space (100.64.0.0/10). Carrier-grade NAT ranges
+  // are not public Internet destinations and routinely reach infrastructure
+  // the platform has no business calling.
+  if (a === 100 && b >= 64 && b <= 127) return "private";
   if (a === 169 && b === 254) return "link-local"; // covers the common cloud metadata address
+  // Oracle Cloud's instance metadata service. 169.254.169.254 is already
+  // covered above as link-local; this provider uses an address outside that
+  // range, so it needs its own rule.
+  if (a === 192 && b === 0 && c === 0 && d === 192) return "metadata";
   return null;
 }
 
@@ -99,6 +115,15 @@ function parseIPv6Groups(hostname: string): number[] | null {
   return nums;
 }
 
+/**
+ * Reads the IPv4 address embedded in the low 32 bits of an IPv6 address.
+ * Only meaningful for prefixes that carry one there (::ffff:0:0/96 and
+ * 64:ff9b::/96); the caller is responsible for confirming the prefix first.
+ */
+function embeddedIPv4(nums: number[]): [number, number, number, number] {
+  return [(nums[6]! >> 8) & 0xff, nums[6]! & 0xff, (nums[7]! >> 8) & 0xff, nums[7]! & 0xff];
+}
+
 function classifyIPv6(nums: number[]): HostCategory {
   if (nums.slice(0, 7).every((n) => n === 0) && nums[7] === 1) {
     return "loopback"; // ::1
@@ -110,13 +135,17 @@ function classifyIPv6(nums: number[]): HostCategory {
   // IPv4-mapped IPv6 (::ffff:0:0/96): reclassify using the embedded IPv4
   // address so ::ffff:127.0.0.1 is treated the same as 127.0.0.1.
   if (nums.slice(0, 5).every((n) => n === 0) && nums[5] === 0xffff) {
-    const embedded: [number, number, number, number] = [
-      (nums[6]! >> 8) & 0xff,
-      nums[6]! & 0xff,
-      (nums[7]! >> 8) & 0xff,
-      nums[7]! & 0xff,
-    ];
-    return classifyIPv4(embedded);
+    return classifyIPv4(embeddedIPv4(nums));
+  }
+
+  // NAT64 well-known prefix (64:ff9b::/96, RFC 6052). On a dual-stack or
+  // NAT64 network these addresses are translated back to the embedded IPv4
+  // destination, so 64:ff9b::a9fe:a9fe reaches 169.254.169.254 and would
+  // otherwise bypass every IPv4 rule above. Classify the embedded address
+  // with the same IPv4 rules rather than treating the host as an ordinary
+  // public IPv6 address.
+  if (nums[0] === 0x0064 && nums[1] === 0xff9b && nums.slice(2, 6).every((n) => n === 0)) {
+    return classifyIPv4(embeddedIPv4(nums));
   }
 
   if ((nums[0]! & 0xfe00) === 0xfc00) return "private"; // fc00::/7 (unique local)
