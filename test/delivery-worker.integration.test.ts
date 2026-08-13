@@ -160,12 +160,14 @@ test("a 2xx delivery is DELIVERED and its signature verifies against the exact t
 });
 
 test("every receiver outcome records exactly one attempt, and one failing delivery does not stop the others", async () => {
+  // Part 5 routes a retryable failure to RETRY_SCHEDULED rather than FAILED;
+  // the attempt recording asserted here is unchanged from Part 4.
   const cases = [
     { name: "2xx", url: receiver.url("/ok"), state: "DELIVERED", outcome: "SUCCESS", category: null, status: 200 },
-    { name: "5xx", url: receiver.url("/error"), state: "FAILED", outcome: "RETRYABLE_FAILURE", category: "HTTP_STATUS", status: 500 },
+    { name: "5xx", url: receiver.url("/error"), state: "RETRY_SCHEDULED", outcome: "RETRYABLE_FAILURE", category: "HTTP_STATUS", status: 500 },
     { name: "non-retryable 4xx", url: receiver.url("/gone"), state: "FAILED", outcome: "PERMANENT_FAILURE", category: "HTTP_STATUS", status: 404 },
-    { name: "timeout", url: receiver.url("/slow"), state: "FAILED", outcome: "RETRYABLE_FAILURE", category: "TIMEOUT", status: null },
-    { name: "connection failure", url: `http://127.0.0.1:${closedPort}/ok`, state: "FAILED", outcome: "RETRYABLE_FAILURE", category: "CONNECTION_ERROR", status: null },
+    { name: "timeout", url: receiver.url("/slow"), state: "RETRY_SCHEDULED", outcome: "RETRYABLE_FAILURE", category: "TIMEOUT", status: null },
+    { name: "connection failure", url: `http://127.0.0.1:${closedPort}/ok`, state: "RETRY_SCHEDULED", outcome: "RETRYABLE_FAILURE", category: "CONNECTION_ERROR", status: null },
   ] as const;
 
   const seeded: SeededDelivery[] = [];
@@ -191,7 +193,12 @@ test("every receiver outcome records exactly one attempt, and one failing delive
     assert.ok(attempts[0]!.durationMs >= 0, testCase.name);
 
     assert.equal(delivery.state, testCase.state, testCase.name);
-    assert.notEqual(delivery.completedAt, null, testCase.name);
+    if (testCase.state === "RETRY_SCHEDULED") {
+      assert.equal(delivery.completedAt, null, testCase.name);
+      assert.notEqual(delivery.nextAttemptAt, null, testCase.name);
+    } else {
+      assert.notEqual(delivery.completedAt, null, testCase.name);
+    }
     if (testCase.state === "FAILED") {
       assert.equal(delivery.failureReason, attempts[0]!.errorMessage, testCase.name);
       assert.equal(delivery.failureReason?.includes(seeded[index]!.secret), false, testCase.name);

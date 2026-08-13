@@ -7,9 +7,22 @@ import type { AppConfig } from "../../app/config.ts";
  * adapter (required by Prisma 7's driver-adapter model). Application code
  * should import `prisma` from this module rather than instantiating its own
  * client.
+ *
+ * `connectionTimeoutMillis` is set explicitly because the pg default is `0`,
+ * meaning a query waits forever for a free connection when the pool is
+ * saturated. That default is not survivable for the delivery worker: a
+ * delivery whose database work stalls indefinitely keeps running past its
+ * processing lease, and the recovery sweep then hands the row to another
+ * worker while the first is still live — the receiver gets the same webhook
+ * twice. Failing fast turns that into an ordinary error the worker isolates,
+ * logs, and recovers from. The bound comes from the same constant the lease
+ * derivation is built on (src/app/config.ts).
  */
 export function createPrismaClient(config: AppConfig): PrismaClient {
-  const adapter = new PrismaPg({ connectionString: config.databaseUrl });
+  const adapter = new PrismaPg({
+    connectionString: config.databaseUrl,
+    connectionTimeoutMillis: config.databaseConnectionTimeoutMs,
+  });
   return new PrismaClient({ adapter });
 }
 

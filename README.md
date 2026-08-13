@@ -45,11 +45,12 @@ npm run dev
 
 The server listens on `http://localhost:3000` by default (`PORT` in `.env`).
 
-> If `docker compose up -d` succeeds but the app or `/health` cannot reach
-> the database, check for another PostgreSQL instance already bound to port
-> 5432 on your machine (e.g. a Homebrew service) — it will intercept the
-> connection before it reaches the container. Stop the other instance or
-> change the host port mapping in `docker-compose.yml` and `DATABASE_URL`.
+> The container publishes PostgreSQL on host port **5433**, not 5432, so it
+> does not collide with a PostgreSQL server already running on the host (a
+> Homebrew service, say) — such a server binds `127.0.0.1:5432` specifically
+> and would silently intercept connections meant for the container. If the
+> app or `/health` still cannot reach the database, check that nothing else
+> holds 5433 and that `DATABASE_URL` names that port.
 
 - Health check: `GET http://localhost:3000/health`
 - API documentation (Swagger UI): `http://localhost:3000/docs`
@@ -142,9 +143,9 @@ and point `DATABASE_URL` at it when running the suite (a shell-exported
 `DATABASE_URL` overrides the value from `.env`):
 
 ```bash
-DATABASE_URL="postgresql://webhooks:webhooks@localhost:5432/webhooks_test?schema=public" \
+DATABASE_URL="postgresql://webhooks:webhooks@localhost:5433/webhooks_test?schema=public" \
   node --env-file-if-exists=.env node_modules/.bin/prisma migrate deploy
-DATABASE_URL="postgresql://webhooks:webhooks@localhost:5432/webhooks_test?schema=public" npm test
+DATABASE_URL="postgresql://webhooks:webhooks@localhost:5433/webhooks_test?schema=public" npm test
 ```
 
 The URL safety unit tests (`test/url-safety.test.ts`) are pure and do not

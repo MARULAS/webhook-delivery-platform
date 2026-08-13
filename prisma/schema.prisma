@@ -1,9 +1,14 @@
 // Part 2 added endpoints, event types, and subscriptions; Part 3 added events
-// and deliveries; Part 4 adds delivery attempts and the claim/lease columns.
-// The retry columns (nextAttemptAt, the automatic-attempt budget) belong to
-// Part 5 and arrive with their own migration (see IMPLEMENTATION_PLAN.md
-// section 2, "Schema evolution across parts"). Nothing here is added before
-// the part that actually reads or writes it.
+// and deliveries; Part 4 added delivery attempts and the claim/lease columns;
+// Part 5 adds retry scheduling (nextAttemptAt and its index). Nothing here is
+// added before the part that actually reads or writes it
+// (IMPLEMENTATION_PLAN.md section 2, "Schema evolution across parts").
+//
+// Part 5 deliberately adds NO automatic-attempt-budget column. The budget is
+// derived by counting persisted DeliveryAttempt rows for the delivery, which
+// is the only count that means "requests this receiver actually saw" — see the
+// attemptCount comment on Delivery below. A stored counter would be a second,
+// redundant source of truth that nothing reads.
 
 generator client {
   provider = "prisma-client"
@@ -119,7 +124,6 @@ enum DeliveryErrorCategory {
 }
 
 // The intended delivery of one event to one endpoint (SPEC.md section 6).
-// The retry columns (nextAttemptAt, automatic-attempt budget) belong to Part 5.
 model Delivery {
   id         String        @id @default(uuid())
   eventId    String
@@ -146,9 +150,14 @@ model Delivery {
   //
   // The numbering gaps are harmless: attempt numbers only have to be unique
   // and increasing. But this column is therefore NOT a count of attempts, and
-  // Part 5's automatic-attempt budget must be counted from DeliveryAttempt
-  // rows rather than read from here — otherwise a receiver's retry budget
-  // could be exhausted by platform-side failures it never saw.
+  // the automatic-attempt budget is counted from DeliveryAttempt rows rather
+  // than read from here — otherwise a receiver's retry budget could be
+  // exhausted by platform-side failures it never saw.
+  //
+  // It is also the worker's fencing token: because the claim mints each value
+  // exactly once, "attemptCount = the number I was granted" identifies the
+  // current owner of the row, and every worker-driven state transition is
+  // guarded on it (src/modules/deliveries/state-transitions.ts).
   attemptCount Int @default(0)
 
   // Processing lease (ARCHITECTURE.md section 11). Written by the claim and
@@ -158,6 +167,13 @@ model Delivery {
   // app/config.ts and is always strictly longer than it.
   claimedAt  DateTime?
   leaseUntil DateTime?
+
+  // When a RETRY_SCHEDULED delivery next becomes eligible (ARCHITECTURE.md
+  // section 14, SPEC.md section 6). Database-backed rather than an in-process
+  // timer, so a restart loses no scheduled retry. Written by the retry branch
+  // of the state transitions and by the lease recovery sweep; cleared by the
+  // claim, so it is null whenever the delivery is not waiting for a retry.
+  nextAttemptAt DateTime?
 
   // Set when the delivery reaches a terminal state, DELIVERED or FAILED
   // ("completion/failure timestamps where applicable", SPEC.md section 6).
@@ -184,11 +200,21 @@ model Delivery {
   // up referencing deliveries by endpointId, which would otherwise be a
   // sequential scan of a table that only grows.
   @@index([endpointId])
-  // Serves the worker's claim query, which selects PENDING rows in createdAt
-  // order (src/worker/delivery-claiming.ts). Without it every poll — several
-  // per second — sequentially scans a table that only grows. A nextAttemptAt
-  // index arrives in Part 5 with the column that needs it.
+  // Serves the PENDING half of the worker's claim query and the lease recovery
+  // sweep's `state = 'PROCESSING'` scan. Without a state-leading index every
+  // poll — several per second — sequentially scans a table that only grows.
+  // Recovery additionally filters on leaseUntil, deliberately left to a filter
+  // rather than given a third index: PROCESSING rows are bounded by the
+  // in-flight work of the running workers, so the state prefix alone already
+  // reduces that scan to a handful of rows.
   @@index([state, createdAt])
+  // Serves the retry half of the same claim query,
+  // `state = 'RETRY_SCHEDULED' AND "nextAttemptAt" <= now()`. Putting the due
+  // time in the second column makes that a range scan; with only
+  // ([state, createdAt]) available the poll would read and filter every
+  // scheduled retry, including the ones not yet due — exactly the set that
+  // grows during a receiver outage.
+  @@index([state, nextAttemptAt])
 }
 
 // One actual outbound HTTP attempt (SPEC.md section 6, ARCHITECTURE.md

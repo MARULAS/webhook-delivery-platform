@@ -7,7 +7,11 @@ services:
       POSTGRES_PASSWORD: webhooks
       POSTGRES_DB: webhooks
     ports:
-      - "5432:5432"
+      # Published on 5433 so the container does not collide with a PostgreSQL
+      # server already listening on the host's default 5432. Inside the
+      # container PostgreSQL still listens on 5432; only the host port differs,
+      # so DATABASE_URL must use 5433.
+      - "5433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:

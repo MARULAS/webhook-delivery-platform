@@ -1,20 +1,25 @@
-import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "../../generated/prisma/client.ts";
+import type { PrismaClient } from "../../generated/prisma/client.ts";
+import { createPrismaClient } from "../../src/infrastructure/database/prisma.ts";
 import { loadConfig, type AppConfig } from "../../src/app/config.ts";
 
 /**
  * Shared test-database wiring for integration tests. Real PostgreSQL, no
  * mocks (focused-testing skill). Point DATABASE_URL at a dedicated test
  * database before running the suite, e.g.:
- *   DATABASE_URL="postgresql://webhooks:webhooks@localhost:5432/webhooks_test?schema=public" npm test
+ *   DATABASE_URL="postgresql://webhooks:webhooks@localhost:5433/webhooks_test?schema=public" npm test
  */
 
 export function testConfig(overrides: Partial<Record<string, string>> = {}): AppConfig {
   return loadConfig({ ...process.env, ...overrides });
 }
 
+/**
+ * Built through the application's own factory, so integration tests exercise
+ * the real client configuration — connection timeout included — rather than a
+ * more forgiving one assembled here.
+ */
 export function createTestPrisma(config: AppConfig = testConfig()): PrismaClient {
-  return new PrismaClient({ adapter: new PrismaPg({ connectionString: config.databaseUrl }) });
+  return createPrismaClient(config);
 }
 
 /**

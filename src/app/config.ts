@@ -25,6 +25,14 @@ export interface AppConfig {
   readonly deliveryTimeoutMs: number;
   /** Derived, not read from the environment. See `deriveDeliveryLeaseMs`. */
   readonly deliveryLeaseMs: number;
+  readonly maxDeliveryAttempts: number;
+  readonly retryBaseDelayMs: number;
+  readonly retryMaxDelayMs: number;
+  readonly workerShutdownGraceMs: number;
+  /** Derived from `LEASE_OVERHEAD_PER_DELIVERY_MS`; see the comment there. */
+  readonly databaseConnectionTimeoutMs: number;
+  /** Derived from `LEASE_OVERHEAD_PER_DELIVERY_MS`; see the comment there. */
+  readonly deliveryTransactionTimeoutMs: number;
 }
 
 export class ConfigError extends Error {
@@ -87,15 +95,37 @@ function parseIntegerEnv(
  * recovery of a genuinely dead worker, while a lease that is too short lets a
  * live delivery be reclaimed and the same webhook sent twice. Erring long is
  * therefore the safe error.
+ *
+ * Since the retry lifecycle exists, this allowance is load-bearing rather than
+ * merely generous: it is what keeps a live delivery from outrunning its lease.
+ * So it is enforced rather than assumed. The two timeouts below are derived
+ * from it and bound the database work a single delivery can perform — an
+ * exhausted connection pool or a transaction blocked on a lock now fails fast
+ * instead of waiting indefinitely while the lease expires underneath it.
+ * Their worst case (a connection wait, then a transaction that waits for its
+ * own connection and then runs) stays inside the allowance.
  */
 const LEASE_OVERHEAD_PER_DELIVERY_MS = 1000;
 
+/** How long a query may wait for a free connection from the pg pool. */
+const DATABASE_CONNECTION_TIMEOUT_MS = LEASE_OVERHEAD_PER_DELIVERY_MS / 4;
+
+/** Maximum duration of the interactive transaction that records an attempt. */
+const DELIVERY_TRANSACTION_TIMEOUT_MS = LEASE_OVERHEAD_PER_DELIVERY_MS / 2;
+
 /**
  * The processing lease is derived from the delivery timeout rather than
- * configured independently, so the invariant "a live delivery is never
- * reclaimed" cannot be broken by a bad environment value — reclaiming work a
- * worker is still performing would send the same webhook twice, which is the
- * highest-severity failure this part can produce.
+ * configured independently, so no environment value can set a lease shorter
+ * than the request it has to cover — reclaiming work a worker is still
+ * performing would send the same webhook twice, which is the highest-severity
+ * failure this system can produce.
+ *
+ * The derivation rests on one assumption it cannot derive: that a delivery's
+ * database work fits inside `LEASE_OVERHEAD_PER_DELIVERY_MS`. That assumption
+ * is enforced by the two timeouts declared with that constant, not merely
+ * hoped for. If it were ever violated anyway, the fencing token on the state
+ * transitions still protects the delivery's *state* — but not the receiver,
+ * which would see the request twice.
  *
  * A worker claims `workerBatchSize` deliveries at once and runs them through a
  * pool of `workerConcurrency`, so each pool slot processes up to
@@ -238,6 +268,56 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     problems,
   );
 
+  // The retry policy's only home (ARCHITECTURE.md section 15). No timing
+  // literal for backoff or for the attempt budget may appear in business code;
+  // src/worker/retry-policy.ts computes purely from these values.
+
+  // SPEC.md section 10 sketches a progression of five attempts, so five is the
+  // default: one initial delivery plus four automatic retries.
+  const maxDeliveryAttempts = parseIntegerEnv(
+    env.MAX_DELIVERY_ATTEMPTS,
+    "MAX_DELIVERY_ATTEMPTS",
+    { min: 1, max: 50, fallback: 5 },
+    problems,
+  );
+
+  // One second: long enough that a receiver restarting or shedding load has a
+  // moment to recover, short enough that the first retry is still prompt. With
+  // the defaults the progression is 1s, 2s, 4s, 8s.
+  const retryBaseDelayMs = parseIntegerEnv(
+    env.RETRY_BASE_DELAY_MS,
+    "RETRY_BASE_DELAY_MS",
+    { min: 1, max: 3_600_000, fallback: 1000 },
+    problems,
+  );
+
+  // The ceiling the doubling saturates at, so a long outage does not push a
+  // retry days into the future.
+  const retryMaxDelayMs = parseIntegerEnv(
+    env.RETRY_MAX_DELAY_MS,
+    "RETRY_MAX_DELAY_MS",
+    { min: 1, max: 86_400_000, fallback: 60_000 },
+    problems,
+  );
+
+  if (retryMaxDelayMs < retryBaseDelayMs) {
+    problems.push(
+      `RETRY_MAX_DELAY_MS (${retryMaxDelayMs}) must be greater than or equal to RETRY_BASE_DELAY_MS (${retryBaseDelayMs}).`,
+    );
+  }
+
+  // How long shutdown waits for the in-flight worker iteration. Bounded on
+  // purpose: work that does not finish inside it stays PROCESSING and is
+  // recovered when its lease expires, because correctness must never depend on
+  // shutdown succeeding (ARCHITECTURE.md section 31). Zero is legal and means
+  // "do not wait at all".
+  const workerShutdownGraceMs = parseIntegerEnv(
+    env.WORKER_SHUTDOWN_GRACE_MS,
+    "WORKER_SHUTDOWN_GRACE_MS",
+    { min: 0, max: 300_000, fallback: 10_000 },
+    problems,
+  );
+
   if (problems.length > 0) {
     throw new ConfigError(`Invalid configuration:\n${problems.map((p) => `  - ${p}`).join("\n")}`);
   }
@@ -254,6 +334,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     workerBatchSize,
     deliveryTimeoutMs,
     deliveryLeaseMs: deriveDeliveryLeaseMs(deliveryTimeoutMs, workerBatchSize, workerConcurrency),
+    maxDeliveryAttempts,
+    retryBaseDelayMs,
+    retryMaxDelayMs,
+    workerShutdownGraceMs,
+    databaseConnectionTimeoutMs: DATABASE_CONNECTION_TIMEOUT_MS,
+    deliveryTransactionTimeoutMs: DELIVERY_TRANSACTION_TIMEOUT_MS,
   });
 }
 

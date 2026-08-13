@@ -34,6 +34,7 @@ export async function startApplication(
         batchSize: config.workerBatchSize,
         deliveryTimeoutMs: config.deliveryTimeoutMs,
         leaseMs: config.deliveryLeaseMs,
+        maxDeliveryAttempts: config.maxDeliveryAttempts,
       },
       "Delivery worker started",
     );
@@ -41,24 +42,26 @@ export async function startApplication(
     app.log.warn("Delivery worker is disabled; deliveries will accumulate in PENDING");
   }
 
-  registerShutdownHandlers(app, prisma, worker);
+  registerShutdownHandlers(app, prisma, config, worker);
 }
 
 /**
  * Registers SIGINT/SIGTERM handlers exactly once each. On either signal: stop
- * claiming new deliveries, stop accepting new connections (Fastify close),
- * then disconnect Prisma. A second signal while shutdown is already in
- * progress is ignored rather than starting a second concurrent shutdown.
+ * claiming new deliveries, let the in-flight iteration finish within a bounded
+ * grace window, stop accepting new connections (Fastify close), then disconnect
+ * Prisma. A second signal while shutdown is already in progress is ignored
+ * rather than starting a second concurrent shutdown.
  *
- * Stopping the worker only halts further claims; it does not wait for an
- * in-flight delivery. Draining in-flight work is Part 5's concern, and the
- * system is designed not to need it: a delivery interrupted mid-flight keeps
+ * The drain is bounded by `WORKER_SHUTDOWN_GRACE_MS` and its outcome is logged,
+ * because a shutdown that waited indefinitely on a slow receiver would be worse
+ * than one that gives up. Giving up is safe: a delivery still in flight keeps
  * its persisted lease and is recovered when that lease expires, so correctness
  * never depends on shutdown completing cleanly (ARCHITECTURE.md section 31).
  */
 function registerShutdownHandlers(
   app: FastifyInstance,
   prisma: PrismaClient,
+  config: AppConfig,
   worker: DeliveryWorker | null,
 ): void {
   let shuttingDown = false;
@@ -70,10 +73,26 @@ function registerShutdownHandlers(
     shuttingDown = true;
 
     app.log.info({ signal }, "Shutting down");
+    // Synchronous and immediate: from here on nothing is claimed and no further
+    // delivery is started.
     worker?.stop();
 
-    app
-      .close()
+    const drained = worker
+      ? worker.drain(config.workerShutdownGraceMs)
+      : Promise.resolve(true);
+
+    drained
+      .then((completed) => {
+        if (completed) {
+          app.log.info("In-flight delivery work finished before shutdown");
+        } else {
+          app.log.warn(
+            { graceMs: config.workerShutdownGraceMs },
+            "Shutdown grace window expired with delivery work still in flight; those deliveries will be recovered when their lease expires",
+          );
+        }
+      })
+      .then(() => app.close())
       .then(() => disconnectDatabase(prisma))
       .then(() => {
         process.exit(0);

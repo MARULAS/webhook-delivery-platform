@@ -130,8 +130,17 @@ export async function executeDelivery(
   };
 
   if (!endpoint.enabled) {
-    await failDeliveryWithoutAttempt(prisma, delivery.id, DISABLED_ENDPOINT_REASON);
-    logger.info({ ...logContext, state: "FAILED" }, "Delivery abandoned: endpoint is disabled");
+    const result = await failDeliveryWithoutAttempt(
+      prisma,
+      delivery.id,
+      claimed.attemptNumber,
+      DISABLED_ENDPOINT_REASON,
+    );
+    if (result.applied) {
+      logger.info({ ...logContext, state: "FAILED" }, "Delivery abandoned: endpoint is disabled");
+    } else {
+      logSuppressedTransition(logger, logContext);
+    }
     return;
   }
 
@@ -144,8 +153,17 @@ export async function executeDelivery(
     // Fail closed. The URL passed validation when it was stored, so reaching
     // here means it changed, or the safety rules did. Either way nothing is
     // sent, and no attempt row is written because no request was made.
-    await failDeliveryWithoutAttempt(prisma, delivery.id, UNSAFE_URL_REASON);
-    logger.warn({ ...logContext, state: "FAILED" }, "Delivery abandoned: endpoint URL is not a permitted destination");
+    const result = await failDeliveryWithoutAttempt(
+      prisma,
+      delivery.id,
+      claimed.attemptNumber,
+      UNSAFE_URL_REASON,
+    );
+    if (result.applied) {
+      logger.warn({ ...logContext, state: "FAILED" }, "Delivery abandoned: endpoint URL is not a permitted destination");
+    } else {
+      logSuppressedTransition(logger, logContext);
+    }
     return;
   }
 
@@ -175,28 +193,56 @@ export async function executeDelivery(
 
   const classification = classifyOutboundOutcome(outcome, config.deliveryTimeoutMs);
 
-  const state = await completeDeliveryWithAttempt(prisma, delivery.id, {
-    attemptNumber: claimed.attemptNumber,
-    attemptedAt,
-    durationMs: outcome.durationMs,
-    ...classification,
-  });
+  const result = await completeDeliveryWithAttempt(
+    prisma,
+    delivery.id,
+    {
+      attemptNumber: claimed.attemptNumber,
+      attemptedAt,
+      durationMs: outcome.durationMs,
+      ...classification,
+    },
+    config,
+  );
 
   const completedContext = {
     ...logContext,
-    state,
+    state: result.state,
     statusCode: classification.httpStatusCode,
     durationMs: outcome.durationMs,
   };
 
-  if (state === "DELIVERED") {
+  if (!result.applied) {
+    // The attempt was still recorded; only the state change was suppressed.
+    logSuppressedTransition(logger, logContext);
+    return;
+  }
+
+  if (result.state === "DELIVERED") {
     logger.info(completedContext, "Delivery succeeded");
-  } else {
+  } else if (result.state === "RETRY_SCHEDULED") {
     // A receiver failure is normal system behavior, not an application fault
     // (ARCHITECTURE.md section 30), so it is logged at warn rather than error.
     logger.warn(
       { ...completedContext, outcome: classification.outcome },
-      "Delivery failed",
+      "Delivery failed; retry scheduled",
+    );
+  } else {
+    logger.warn(
+      { ...completedContext, outcome: classification.outcome },
+      "Delivery failed permanently",
     );
   }
+}
+
+/**
+ * The delivery changed hands while this attempt was in flight: its lease
+ * expired, recovery returned it to a processable state, and another claim took
+ * ownership. The fencing guard in the state transitions suppressed this
+ * worker's write (see src/modules/deliveries/state-transitions.ts). Expected
+ * under recovery rather than exceptional — but never silent, because it means
+ * a receiver saw a request whose result the platform did not act on.
+ */
+function logSuppressedTransition(logger: Logger, logContext: Record<string, unknown>): void {
+  logger.warn(logContext, "Delivery changed hands before this attempt completed; state left untouched");
 }
