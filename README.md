@@ -1,524 +1,647 @@
-# Webhook Delivery Platform
+<div align="center">
 
-A backend service for reliably delivering event notifications to external
-HTTP endpoints: asynchronous processing, bounded exponential-backoff
-retries, crash recovery, idempotent publication, and HMAC-SHA256 signed
-outbound requests.
+# 📬 Webhook Delivery Platform
 
-The system is functionally complete: endpoints and subscriptions can be
-managed, events are published durably and fanned out to matching
-subscribers, a background worker delivers them asynchronously with retries
-and lease-based crash recovery, failed deliveries can be manually retried,
-delivery history and basic metrics are queryable, and the whole flow is
-demonstrable locally with nothing beyond Docker Compose and Node.js.
+**A reliable backend service for asynchronously delivering application events to subscribed HTTP endpoints.**
 
-## Architecture at a glance
+[![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Fastify](https://img.shields.io/badge/Fastify-REST%20API-000000?logo=fastify&logoColor=white)](https://fastify.dev)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![Prisma](https://img.shields.io/badge/Prisma-ORM-2D3748?logo=prisma&logoColor=white)](https://www.prisma.io)
+[![Tests](https://img.shields.io/badge/tests-135%2F135%20passing-brightgreen)]()
+[![Status](https://img.shields.io/badge/status-completed-success)]()
 
-A single Node.js/Fastify process serves the REST API and runs the
-background delivery worker together (a modular monolith, not
-microservices). PostgreSQL is the only durable store and the only
-coordination mechanism between them:
+</div>
 
-```text
-API request → validate → persist Event + PENDING Deliveries (one transaction) → respond
-                                          │
-                                          ▼ (never called directly by the API)
-                                   PostgreSQL (source of truth)
-                                          │
-                                          ▼
-                            Delivery Worker (same process)
-                     claim (SKIP LOCKED) → sign → POST → record attempt → transition state
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Architecture](#architecture)
+- [Delivery Lifecycle](#delivery-lifecycle)
+- [Reliability & Retry Behavior](#reliability--retry-behavior)
+- [Crash Recovery](#crash-recovery)
+- [Idempotent Event Publication](#idempotent-event-publication)
+- [Webhook Signing](#webhook-signing)
+- [SSRF Protection](#ssrf-protection)
+- [API Reference](#api-reference)
+- [Metrics](#metrics)
+- [Getting Started](#getting-started)
+- [Configuration](#configuration)
+- [Testing](#testing)
+- [Local End-to-End Demo](#local-end-to-end-demo)
+- [Project Structure](#project-structure)
+- [Known Limitations](#known-limitations)
+- [Project Status](#project-status)
+- [Author](#author)
+
+---
+
+## Overview
+
+The platform acts as a reliable intermediary between applications that **produce** events and external systems that want to **receive** them.
+
+It persists events before processing, delivers webhooks through a PostgreSQL-backed background worker, retries transient failures with bounded exponential backoff, recovers interrupted work through processing leases, prevents duplicate publication with idempotency keys, and signs every outbound request using HMAC-SHA256.
+
+### What happens when you publish an event
+
+When an application publishes an `order.completed` event, the platform:
+
+| # | Step |
+|---|------|
+| 1 | Persists the event in PostgreSQL |
+| 2 | Finds webhook endpoints subscribed to `order.completed` |
+| 3 | Creates a delivery record for each matching endpoint |
+| 4 | **Returns immediately** to the event producer |
+| 5 | Processes the deliveries asynchronously in the background |
+| 6 | Signs each outbound request with HMAC-SHA256 |
+| 7 | Records every delivery attempt |
+| 8 | Retries temporary failures automatically |
+| 9 | Marks exhausted or permanent failures as `FAILED` |
+| 10 | Allows failed deliveries to be retried manually |
+
+> [!NOTE]
+> The producer never has to wait for — or directly depend on — external systems.
+
+```mermaid
+flowchart LR
+    App[Producer Application] -->|POST /events| API[REST API]
+    API --> DB[(PostgreSQL)]
+    DB --> W[Delivery Worker]
+    W -->|signed HTTP| E1[Webhook Endpoint A]
+    W -->|signed HTTP| E2[Webhook Endpoint B]
+    W -->|signed HTTP| E3[Webhook Endpoint C]
+    W -.->|persist attempt| DB
 ```
 
-Publishing an event never performs an outbound HTTP request; the worker is
-the only thing that does. This keeps API response latency independent of
-receiver behavior and is enforced by keeping delivery execution unreachable
-from route/service code, not just by convention.
+---
 
-**Tech stack:** Node.js (22+) with TypeScript in strict mode, Fastify,
-Prisma, PostgreSQL, Docker Compose for local infrastructure, and
-OpenAPI/Swagger for API documentation. No Redis, Kafka, queue broker, or
-other distributed infrastructure — retry scheduling, delivery claiming, and
-crash recovery are all PostgreSQL-backed (see "Asynchronous delivery" below).
+## Features
 
-## Prerequisites
+<table>
+<tr><td valign="top" width="50%">
 
-- Node.js 22 or later
-- Docker and Docker Compose
+**Core**
+- Webhook endpoint management
+- Event-type subscriptions
+- Durable event publication
+- Transactional delivery fan-out
+- Idempotent event creation
+- Delivery filtering and pagination
+- Operational metrics
 
-## Setup (clean machine)
+</td><td valign="top" width="50%">
 
-```bash
-# 1. Start PostgreSQL
-docker compose up -d
+**Worker & Reliability**
+- PostgreSQL-backed asynchronous worker
+- Atomic claiming with `FOR UPDATE SKIP LOCKED`
+- Bounded worker concurrency
+- Bounded exponential-backoff retries
+- Durable retry scheduling
+- Processing leases and crash recovery
+- Manual retry for failed deliveries
 
-# 2. Configure environment
-cp .env.example .env
+</td></tr>
+<tr><td valign="top">
 
-# 3. Install dependencies
-npm ci
+**Security**
+- HMAC-SHA256 request signing
+- SSRF protections for outbound URLs
+- HTTPS enforced in production
 
-# 4. Generate the Prisma client
-npm run db:generate
+</td><td valign="top">
 
-# 5. Apply migrations
-npm run db:migrate
+**Observability & DX**
+- Delivery attempt history
+- HTTP timeout handling
+- Retryable / permanent failure classification
+- OpenAPI / Swagger documentation
+- Local end-to-end webhook receiver
 
-# 6. Seed the fixed event type catalog
-npm run db:seed
+</td></tr>
+</table>
 
-# 7. Run the server
-npm run dev
+---
+
+## Tech Stack
+
+| Technology | Purpose |
+|------------|---------|
+| **Node.js 22+** | Application runtime |
+| **TypeScript** | Strictly typed implementation |
+| **Fastify** | REST API and server |
+| **PostgreSQL 16** | Durable persistence and worker coordination |
+| **Prisma** | Database access and migrations |
+| **Docker Compose** | Local PostgreSQL infrastructure |
+| **OpenAPI / Swagger** | Interactive API documentation |
+| **node:test** | Unit and integration testing |
+
+> [!IMPORTANT]
+> The application intentionally requires **no Redis, Kafka, RabbitMQ, or any other message broker.** Pending work, retry schedules, processing leases, and delivery attempts are all persisted directly in PostgreSQL.
+
+---
+
+## Architecture
+
+The project is implemented as a **modular monolith**. A single Node.js process contains two logical responsibilities — the REST API and the background delivery worker — with PostgreSQL as the durable source of truth shared by both.
+
+```mermaid
+flowchart TD
+    A[POST /events] --> B[Validate request]
+    B --> C["Persist Event + Deliveries<br/>(single transaction)"]
+    C --> D[Return HTTP response]
+    C --> DB[(PostgreSQL)]
+    DB --> W[Background Worker]
+    W --> CL[Atomic batch claim]
+    CL --> SG[Sign HTTP request]
+    SG --> EP[External endpoint]
+    EP --> PR[Persist attempt / result]
+    PR --> DB
 ```
 
-The server listens on `http://localhost:3000` by default (`PORT` in `.env`).
+> [!NOTE]
+> Publishing an event **never** sends the webhook directly. Outbound HTTP communication belongs exclusively to the background worker, which keeps API response time independent of receiver behavior.
 
-> The container publishes PostgreSQL on host port **5433**, not 5432, so it
-> does not collide with a PostgreSQL server already running on the host (a
-> Homebrew service, say) — such a server binds `127.0.0.1:5432` specifically
-> and would silently intercept connections meant for the container. If the
-> app or `/health` still cannot reach the database, check that nothing else
-> holds 5433 and that `DATABASE_URL` names that port.
+---
 
-- Health check: `GET http://localhost:3000/health`
-- API documentation (Swagger UI): `http://localhost:3000/docs`
-- Raw OpenAPI document: `http://localhost:3000/docs/json`
+## Delivery Lifecycle
 
-## Configuration
-
-All configuration is read from environment variables by `src/app/config.ts`,
-the only module allowed to read `process.env` in the application itself.
-Missing or invalid required values abort startup immediately with a message
-on stderr and a non-zero exit code — there are no silent defaults for
-anything security- or correctness-relevant. See `.env.example` for the full,
-documented list, including the worker's poll interval, concurrency, batch
-size, delivery timeout, retry backoff, and shutdown grace period.
-
-Two configuration values matter most for local demonstration:
-
-- `ALLOW_LOCAL_ENDPOINTS` — off by default, and structurally impossible to
-  enable under `NODE_ENV=production` (startup itself fails if both are set,
-  and the URL safety module independently refuses to honor the flag under
-  production configuration regardless — see "Endpoint safety / SSRF
-  protections" below). Set it to `true` in development so a webhook endpoint
-  can point at `127.0.0.1`, which is otherwise rejected as an SSRF risk.
-- `DELIVERY_TIMEOUT_MS` — the hard timeout on one outbound webhook request.
-
-## API surface
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/endpoints` | Register a webhook endpoint (generates the signing secret server-side; never returned) |
-| `GET` | `/endpoints` | List webhook endpoints |
-| `GET` | `/endpoints/:endpointId` | Fetch a webhook endpoint |
-| `PATCH` | `/endpoints/:endpointId` | Update a webhook endpoint, including enabling/disabling it via `enabled` — there is no separate disable route |
-| `DELETE` | `/endpoints/:endpointId` | Delete a webhook endpoint; its subscriptions cascade-delete with it |
-| `POST` | `/endpoints/:endpointId/subscriptions` | Subscribe an endpoint to an event type by name (e.g. `"order.created"`) |
-| `GET` | `/endpoints/:endpointId/subscriptions` | List an endpoint's subscriptions |
-| `DELETE` | `/endpoints/:endpointId/subscriptions/:subscriptionId` | Remove a subscription |
-| `POST` | `/events` | Publish an event; supports the optional `Idempotency-Key` header |
-| `GET` | `/events/:eventId` | Fetch a published event |
-| `GET` | `/events/:eventId/deliveries` | List the deliveries created for an event |
-| `GET` | `/deliveries` | List deliveries, filterable by `status`, `endpointId`, `eventId`; bounded `limit`/`offset` pagination |
-| `GET` | `/deliveries/:deliveryId` | Fetch a single delivery |
-| `GET` | `/deliveries/:deliveryId/attempts` | List a delivery's full attempt history, oldest first |
-| `POST` | `/deliveries/:deliveryId/retry` | Manually retry a `FAILED` delivery; `409` from any other state, `404` for an unknown id |
-| `GET` | `/metrics` | Basic operational metrics computed from persisted rows |
-| `GET` | `/health` | Liveness/readiness, including database reachability |
-
-No endpoint response ever includes the signing secret — every response
-schema simply has no property for it (`fast-json-stringify` cannot emit a
-field it was not told about), and it is confirmed by integration tests. The
-event type catalog is fixed and seeded (`prisma/seed.ts`); it has no public
-CRUD route. Outbound URLs are validated by
-`src/infrastructure/security/url-safety.ts` (SSRF protection) at both
-creation and update, and again immediately before every delivery attempt.
-
-Every non-2xx response uses one shared shape:
-
-```json
-{ "error": { "code": "NOT_FOUND", "message": "…", "requestId": "…", "details": {} } }
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> PROCESSING : claimed by worker
+    PROCESSING --> DELIVERED : 2xx response
+    PROCESSING --> RETRY_SCHEDULED : retryable failure
+    RETRY_SCHEDULED --> PROCESSING : nextAttemptAt is due
+    PROCESSING --> FAILED : permanent failure / budget exhausted
+    FAILED --> PENDING : manual retry
+    DELIVERED --> [*]
 ```
 
-`details` is present only for some error categories (e.g. AJV schema
-validation failures) and is never a stack trace or a Prisma internal.
-Swagger documents this shape for every status code a given route can
-actually return.
+Every real outbound request creates a persistent `DeliveryAttempt` record. **Attempt history is preserved even when a delivery is manually retried.**
 
-### Publishing an event
+---
+
+## Reliability & Retry Behavior
+
+The worker atomically claims eligible deliveries from PostgreSQL using `FOR UPDATE SKIP LOCKED`. This prevents multiple workers from claiming the same row at the same time, while avoiding unnecessary blocking between them.
+
+**Eligible deliveries are:**
+- `PENDING`
+- `RETRY_SCHEDULED` whose `nextAttemptAt` is due
+
+**Retryable failures use bounded exponential backoff:**
+
+```
+delay = min(baseDelay × 2^(attempts - 1), maximumDelay)
+```
+
+Retry timing is stored in PostgreSQL rather than represented by long-lived in-memory timers — so **scheduled retries survive application restarts.**
+
+### HTTP Result Classification
+
+| Result | Behavior |
+|--------|----------|
+| `2xx` | ✅ `DELIVERED` |
+| `408` Request Timeout | 🔁 Retryable |
+| `429` Too Many Requests | 🔁 Retryable |
+| `5xx` | 🔁 Retryable |
+| Timeout | 🔁 Retryable |
+| Connection failure | 🔁 Retryable |
+| Other `4xx` | ❌ Permanent failure |
+| `3xx` | ❌ Permanent failure — redirects are not followed |
+
+When the configured retry budget is exhausted, the delivery becomes `FAILED`.
+
+---
+
+## Crash Recovery
+
+Every claimed delivery receives a **processing lease** containing `claimedAt` and `leaseUntil`.
+
+If the worker terminates mid-processing, the lease eventually expires. A recovery sweep detects expired `PROCESSING` deliveries and returns them to a processable state — preventing deliveries from becoming permanently stuck after a crash.
+
+> [!WARNING]
+> The platform provides **at-least-once** delivery, not exactly-once.
+>
+> A process can theoretically crash after the receiver accepts the request but before the platform records the result. In that case, the request may later be sent again.
+>
+> **Webhook receivers should deduplicate using the `deliveryId` contained in the webhook body.**
+
+---
+
+## Idempotent Event Publication
+
+`POST /events` supports the optional `Idempotency-Key` header.
 
 ```bash
 curl -X POST http://localhost:3000/events \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000' \
-  -d '{"type":"order.completed","payload":{"orderId":5821,"amount":1499}}'
+  -d '{
+    "type": "order.completed",
+    "payload": {
+      "orderId": 5821,
+      "amount": 1499
+    }
+  }'
 ```
 
-Publication persists the event and, in the same transaction, one `PENDING`
-delivery per **enabled** endpoint holding a subscription to that event type.
-A disabled endpoint receives none, and an event with no matching
-subscription is still accepted with zero deliveries. No outbound HTTP
-request happens during publication; the response time does not depend on
-any receiver — delivery is asynchronous, performed by the background worker.
+| Scenario | Result |
+|----------|--------|
+| Same key + same request | `200` — the original event is returned |
+| Same key + different request | `409 Conflict` |
+| New request | `201` — event is created |
 
-`Idempotency-Key` is optional and unique across events when present:
+Uniqueness is enforced by PostgreSQL, so concurrent requests using the same key cannot create duplicate events.
 
-- replaying the same key with the same request returns the **original**
-  event with `200` instead of creating a second event and delivery set;
-- reusing the same key for a materially different request is an idempotency
-  conflict and returns `409`.
+---
 
-Uniqueness is enforced by a unique index in PostgreSQL and the resulting
-constraint violation is handled, so two genuinely concurrent requests with
-one key still produce exactly one event — not merely "usually one" under a
-read-then-write race.
+## Webhook Signing
 
-## Asynchronous delivery, retries, and recovery
+Every outbound webhook is signed using **HMAC-SHA256**.
 
-The worker polls PostgreSQL for eligible deliveries (`PENDING`, or
-`RETRY_SCHEDULED` whose `nextAttemptAt` is due), claims a bounded batch
-atomically with a `FOR UPDATE SKIP LOCKED` query so two workers never claim
-the same row, and runs the batch through a bounded concurrency pool
-(`WORKER_CONCURRENCY`). Nothing about scheduled work lives only in process
-memory: `nextAttemptAt` and the claim/lease columns are all persisted
-columns, not `setTimeout` calls, so a restart loses no pending or scheduled
-work.
+**Headers:**
 
-A claimed delivery gets a **processing lease** (`claimedAt`/`leaseUntil`,
-derived from `DELIVERY_TIMEOUT_MS` and always longer than it — see the
-derivation comment in `src/app/config.ts`). If the process crashes or is
-killed mid-delivery, the lease eventually expires and a recovery sweep
-returns the delivery to a processable state without losing any
-`DeliveryAttempt` history, so nothing stays stuck in `PROCESSING` forever.
-
-Retry policy is bounded exponential backoff, computed by a pure function
-(`src/worker/retry-policy.ts`) from `MAX_DELIVERY_ATTEMPTS`,
-`RETRY_BASE_DELAY_MS`, and `RETRY_MAX_DELAY_MS` — never a literal embedded in
-business logic. HTTP response classification:
-
-- `2xx` → success, delivery `DELIVERED`;
-- `408`, `429`, any `5xx`, a timeout, or a connection failure → retryable,
-  `RETRY_SCHEDULED` until the attempt budget is exhausted, then `FAILED`;
-- every other `4xx`, and any `3xx` (redirects are never followed — see SSRF
-  notes below) → permanent failure, straight to `FAILED` without consuming
-  retry budget.
-
-Manual retry (`POST /deliveries/:deliveryId/retry`) is legal only from
-`FAILED`. It returns the delivery to `PENDING`, resets the automatic-attempt
-budget so it is not immediately re-exhausted, and preserves every prior
-`DeliveryAttempt` — attempt numbering continues rather than restarting.
-Retrying from any other state returns `409` and changes nothing; an unknown
-delivery id returns `404`.
-
-Delivery is **at-least-once**, not exactly-once — a worker crash after a receiver
-accepted a request but before the platform recorded the outcome can result
-in the same webhook being sent again. Receivers should deduplicate on
-`deliveryId`, which is included in every delivery's payload envelope.
-
-## Webhook signing and receiver-side verification
-
-Each outbound request is a `POST` with a JSON body and two signing headers,
-generated by `src/infrastructure/security/signing.ts`, the single place in
-the codebase that computes a signature:
-
-```text
-X-Webhook-Timestamp: <unix time in whole seconds>
-X-Webhook-Signature: sha256=<lowercase hex HMAC-SHA256>
+```http
+X-Webhook-Timestamp: <unix timestamp>
+X-Webhook-Signature: sha256=<hex signature>
 ```
 
-```text
-signature = HMAC-SHA256(key = endpoint signing secret, message = "<timestamp>." + <raw body bytes>)
-```
-
-The payload is serialized exactly once; that same byte array is both the
-HMAC input and the request body sent over the wire, so there is no
-opportunity for a re-serialization to produce bytes that do not match what
-was signed. The body is:
-
-```json
-{ "deliveryId": "…", "eventId": "…", "type": "order.completed",
-  "createdAt": "…", "payload": { } }
-```
-
-A receiver should verify the signature against the **raw** body, before
-parsing it as JSON, using a constant-time comparison, and should reject a
-request whose timestamp falls outside a tolerance window it considers
-acceptable (basic replay protection). Redirects are
-never followed by the outbound client, so a receiver never needs to worry
-about a signed request being redirected to an unintended destination.
-
-`scripts/verify-signature.ts` is the reference implementation of that
-verification — a small, pure `verifyWebhookSignature()` function using
-`crypto.timingSafeEqual` for the comparison and a configurable timestamp
-tolerance (5 minutes by default). `scripts/demo-receiver.ts` (see "Running
-the local demo" below) uses it on every request it receives and logs the
-result (`valid` / `invalid (<reason>)`) to stdout — never the secret itself.
-`test/verify-signature.test.ts` exercises it against a real signature
-produced by the platform's own signing code, including a tampered payload,
-a tampered signature, a wrong secret, and a stale timestamp.
-
-## Endpoint safety / SSRF protections
-
-Because the platform makes outbound requests to user-supplied URLs,
-`src/infrastructure/security/url-safety.ts` is the single, centralized
-decision point for whether a destination is safe — called at endpoint
-creation, at endpoint update, and again immediately before every delivery
-attempt (an endpoint can be repointed or disabled in the unbounded time
-between publication and delivery). It rejects:
-
-- schemes other than `http`/`https` (`https` is required under
-  `NODE_ENV=production`);
-- `localhost` and its variants, loopback addresses (`127.0.0.0/8`, `::1`),
-  the unspecified address, and embedded credentials;
-- private and link-local ranges (RFC 1918, RFC 6598 carrier-grade NAT,
-  IPv6 unique-local/`fe80::/10`), including numeric-encoding tricks
-  (decimal/hex/octal IPv4 literals) and IPv4-mapped/NAT64 IPv6 addresses
-  that embed one of the above;
-- known cloud metadata addresses (`169.254.169.254` and Oracle Cloud's
-  `192.0.0.192`);
-- malformed hosts.
-
-`ALLOW_LOCAL_ENDPOINTS` (off by default) is the one explicit,
-development-only exemption, and it only ever exempts loopback/localhost —
-never a private or link-local range. It cannot take effect in production:
-setting it alongside `NODE_ENV=production` fails startup outright, and the
-URL safety module independently refuses to honor it whenever
-`nodeEnv === "production"`, so a single weakened guard elsewhere could not
-silently open this up.
-
-**Known, accepted limitation:** this module validates the literal host
-given in the URL. It does not perform DNS resolution, so a hostname that
-resolves to a public address at validation time but is later repointed at
-an internal address (DNS rebinding) is not caught. This is an explicitly
-accepted risk for this project's scope, documented rather than silently
-ignored.
-
-## Basic metrics
-
-`GET /metrics` reports, computed live from PostgreSQL aggregate queries (no
-separate metrics infrastructure): total events accepted, total deliveries
-created, delivered, failed, pending-or-retrying, success rate, and average
-delivery duration in milliseconds.
-
-## Project structure
+**Signature input:**
 
 ```
-src/
-├── app/                 server assembly, configuration, lifecycle, health route
-├── modules/
-│   ├── endpoints/        webhook endpoint CRUD (routes, schemas, service)
-│   ├── subscriptions/     endpoint-to-event-type subscriptions
-│   ├── events/            event publication, idempotency, delivery fan-out
-│   ├── deliveries/        delivery/attempt reads, filtering, state transitions, manual retry
-│   └── metrics/           basic operational metrics
-├── worker/               delivery loop, atomic claiming, retry policy, lease recovery, per-delivery execution
-├── infrastructure/
-│   ├── database/          Prisma client
-│   ├── http/               outbound webhook client (timeout, no hidden retries)
-│   ├── logging/             structured logging
-│   └── security/            outbound URL safety (SSRF) and HMAC-SHA256 signing
-└── shared/errors/        shared application error model, Fastify error handler, OpenAPI error schema
-prisma/                   schema.prisma, migrations/, seed.ts (event type catalog)
-scripts/                  demo-only: local test receiver and its signature-verification module
-test/                     node:test suite (unit + integration)
+HMAC-SHA256(
+    endpoint signing secret,
+    "<timestamp>." + <raw request body>
+)
 ```
+
+The payload is serialized once — the exact bytes used to calculate the signature are also sent as the HTTP request body.
+
+### Receiver verification checklist
+
+1. Read the **raw** request body.
+2. Recalculate the HMAC using the signing secret.
+3. Compare signatures using a **constant-time** comparison.
+4. Validate that the timestamp falls within an acceptable tolerance window.
+5. Only then parse and process the payload.
+
+> 📄 `scripts/verify-signature.ts` contains the reference verification implementation.
+
+---
+
+## SSRF Protection
+
+Because webhook URLs are user-controlled, the platform validates them **both when stored and immediately before each outbound request.**
+
+<details>
+<summary><b>The validator rejects…</b></summary>
+
+- Unsupported URL schemes
+- Embedded credentials
+- `localhost` and loopback addresses
+- Private IPv4 networks
+- IPv6 local / private ranges
+- Link-local addresses
+- CGNAT addresses
+- Known cloud metadata IP addresses
+- IPv4-mapped IPv6 bypasses
+- NAT64-embedded private or metadata addresses
+- Malformed hosts
+
+</details>
+
+**Production requires HTTPS.** Local addresses may only be enabled explicitly during development:
+
+```bash
+ALLOW_LOCAL_ENDPOINTS=true
+```
+
+The application **refuses to start** if this option is enabled with `NODE_ENV=production`.
+
+> [!WARNING]
+> **Known limitation:** the validator operates on the literal hostname supplied in the URL and does not perform DNS resolution. DNS rebinding is therefore outside the implemented protection scope.
+
+---
+
+## API Reference
+
+### Endpoint Management
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/endpoints` | Register a webhook endpoint |
+| `GET` | `/endpoints` | List endpoints |
+| `GET` | `/endpoints/:endpointId` | Get an endpoint |
+| `PATCH` | `/endpoints/:endpointId` | Update or enable/disable an endpoint |
+| `DELETE` | `/endpoints/:endpointId` | Delete an endpoint |
+
+### Subscriptions
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/endpoints/:endpointId/subscriptions` | Subscribe to an event type |
+| `GET` | `/endpoints/:endpointId/subscriptions` | List subscriptions |
+| `DELETE` | `/endpoints/:endpointId/subscriptions/:subscriptionId` | Remove a subscription |
+
+### Events
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/events` | Publish an event |
+| `GET` | `/events/:eventId` | Get an event |
+| `GET` | `/events/:eventId/deliveries` | List deliveries created for an event |
+
+### Deliveries
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/deliveries` | List / filter deliveries |
+| `GET` | `/deliveries/:deliveryId` | Get delivery details |
+| `GET` | `/deliveries/:deliveryId/attempts` | Get complete attempt history |
+| `POST` | `/deliveries/:deliveryId/retry` | Retry a failed delivery |
+
+### Operations
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/metrics` | Retrieve operational metrics |
+| `GET` | `/health` | Check application and database health |
+
+> Full interactive documentation is available through **Swagger** at `/docs`.
+
+---
+
+## Metrics
+
+`GET /metrics` calculates operational information directly from PostgreSQL — no external monitoring infrastructure required.
+
+- Total events
+- Total deliveries
+- Delivered deliveries
+- Failed deliveries
+- Pending / retrying deliveries
+- Success rate
+- Average successful-delivery duration
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js **22 or later**
+- Docker
+- Docker Compose
+
+### Setup
+
+```bash
+# 1. Clone and enter the project
+git clone <repository-url>
+cd webhook-platform
+
+# 2. Start PostgreSQL
+docker compose up -d
+
+# 3. Create the local configuration
+cp .env.example .env
+
+# 4. Install dependencies
+npm ci
+
+# 5. Generate the Prisma client
+npm run db:generate
+
+# 6. Apply database migrations
+npm run db:migrate
+
+# 7. Seed the event-type catalog
+npm run db:seed
+
+# 8. Start the application
+npm run dev
+```
+
+### Where things live
+
+| Resource | URL |
+|----------|-----|
+| API | http://localhost:3000 |
+| Swagger UI | http://localhost:3000/docs |
+| OpenAPI JSON | http://localhost:3000/docs/json |
+| Health check | http://localhost:3000/health |
+
+> [!TIP]
+> **PostgreSQL runs on host port `5433`** (`localhost:5433`), not the usual `5432`, so the development container doesn't conflict with another local PostgreSQL installation. The container itself still uses `5432` internally.
+
+---
+
+## Configuration
+
+All application configuration is centralized in `src/app/config.ts`. The application **fails fast during startup** when required or security-sensitive configuration is missing or invalid.
+
+### Key worker settings
+
+| Variable | Purpose |
+|----------|---------|
+| `WORKER_POLL_INTERVAL_MS` | How often the worker polls for eligible deliveries |
+| `WORKER_CONCURRENCY` | Maximum deliveries processed in parallel |
+| `WORKER_BATCH_SIZE` | Number of deliveries claimed per batch |
+| `DELIVERY_TIMEOUT_MS` | Outbound HTTP request timeout |
+| `MAX_DELIVERY_ATTEMPTS` | Retry budget before a delivery is marked `FAILED` |
+| `RETRY_BASE_DELAY_MS` | Base delay for exponential backoff |
+| `RETRY_MAX_DELAY_MS` | Upper bound on backoff delay |
+| `WORKER_SHUTDOWN_GRACE_MS` | Graceful shutdown window for in-flight work |
+
+> See `.env.example` for the complete configuration.
+
+---
 
 ## Testing
 
-```bash
-npm test
-```
-
-The test command loads `.env` if present, so `DATABASE_URL` and the rest of
-the configuration are available the same way they are for `dev`/`start`. It
-also passes `--test-concurrency=1`: the integration tests share one database
-and truncate it between tests, so running test *files* in parallel would let
-them delete each other's fixtures. Tests within a file already run in
-sequence, and genuine concurrency is created inside a test where it is the
-thing being asserted (e.g. the idempotency race, parallel delivery claims).
-
-The integration tests touch the database extensively — endpoint/subscription
-CRUD, the duplicate-subscription constraint under concurrency, secret
-absence from every response shape, event publication and the idempotency
-race, transactional fan-out, worker claiming and concurrency limits, the
-full retry/backoff/recovery lifecycle, manual retry, delivery history
-filters, and metrics. To keep those isolated from development data, create a
-separate test database once:
+Create an isolated test database once:
 
 ```bash
 docker compose exec postgres createdb -U webhooks webhooks_test
 ```
 
-and point `DATABASE_URL` at it when running the suite (a shell-exported
-`DATABASE_URL` overrides the value from `.env`):
+Apply migrations:
 
 ```bash
 DATABASE_URL="postgresql://webhooks:webhooks@localhost:5433/webhooks_test?schema=public" \
-  node --env-file-if-exists=.env node_modules/.bin/prisma migrate deploy
-DATABASE_URL="postgresql://webhooks:webhooks@localhost:5433/webhooks_test?schema=public" npm test
+node --env-file-if-exists=.env node_modules/.bin/prisma migrate deploy
 ```
 
-Pure unit tests (URL safety, retry-policy arithmetic, HMAC signing,
-signature verification, config validation, the error handler) do not touch
-the database and pass under either `DATABASE_URL`.
+Run the complete test suite:
 
-## Running the local demo
+```bash
+DATABASE_URL="postgresql://webhooks:webhooks@localhost:5433/webhooks_test?schema=public" \
+npm test
+```
 
-This walks through every core scenario the platform supports — register,
-subscribe, publish, successful delivery, simulated failure with retries,
-eventual success or permanent failure, manual retry, history inspection,
-signature verification, and duplicate-request protection — using
-`scripts/demo-receiver.ts` as the receiver. All commands below assume the
-setup steps above have already been run.
+Type-check independently:
 
-1. **Start PostgreSQL and the application**, with the development SSRF
-   exemption enabled so a `127.0.0.1` endpoint is accepted, and a short
-   delivery timeout/retry backoff so the demo does not require long waits:
+```bash
+npm run typecheck
+```
 
-   ```bash
-   docker compose up -d
-   ALLOW_LOCAL_ENDPOINTS=true DELIVERY_TIMEOUT_MS=2000 WORKER_POLL_INTERVAL_MS=300 \
-     MAX_DELIVERY_ATTEMPTS=3 RETRY_BASE_DELAY_MS=500 RETRY_MAX_DELAY_MS=2000 \
-     npm run dev
-   ```
+<details>
+<summary><b>135 passing automated tests — coverage areas</b></summary>
 
-2. **Start demo receivers**, one per scenario, each on its own port. A
-   receiver's signing secret is not yet known at this point — endpoint
-   creation generates it, and it can be picked up in step 3.
+- Endpoint and subscription management
+- URL safety
+- Event publication
+- Concurrent idempotency
+- Transactional fan-out
+- Atomic worker claiming
+- Delivery concurrency limits
+- HMAC signing
+- HTTP failure classification
+- Retry scheduling
+- Lease recovery
+- Stale-worker fencing
+- Manual retry
+- Delivery history
+- Metrics
+- Receiver-side signature verification
+- Full public-API end-to-end delivery flow
 
-   ```bash
-   # Always succeeds
-   node scripts/demo-receiver.ts --port=4000 --mode=success --secret=placeholder
+</details>
 
-   # Fails the first 2 requests, then succeeds — demonstrates retry-then-success
-   node scripts/demo-receiver.ts --port=4001 --mode=success --fail-times=2 --secret=placeholder
+---
 
-   # Always fails with 500 — demonstrates exhausting the retry budget
-   node scripts/demo-receiver.ts --port=4002 --mode=fail --secret=placeholder
+## Local End-to-End Demo
 
-   # Never responds in time — demonstrates a delivery timeout
-   node scripts/demo-receiver.ts --port=4003 --mode=timeout --secret=placeholder --delivery-timeout-ms=2000
-   ```
+**1.** Start the app with the development-only loopback exception enabled:
 
-   (`--secret` only affects the logged verification result, not the
-   response status, so the demo works even before it is corrected — see
-   step 7 to make signature verification actually pass.)
+```bash
+ALLOW_LOCAL_ENDPOINTS=true \
+DELIVERY_TIMEOUT_MS=2000 \
+WORKER_POLL_INTERVAL_MS=300 \
+MAX_DELIVERY_ATTEMPTS=3 \
+RETRY_BASE_DELAY_MS=500 \
+RETRY_MAX_DELAY_MS=2000 \
+npm run dev
+```
 
-3. **Create webhook endpoints**, one per receiver, and **subscribe** each to
-   `order.completed`:
+**2.** Start a local receiver:
 
-   ```bash
-   curl -X POST http://localhost:3000/endpoints -H 'Content-Type: application/json' \
-     -d '{"name":"success","url":"http://127.0.0.1:4000/hook"}'
-   # repeat for the retry (4001), fail (4002), and timeout (4003) receivers,
-   # and again for a "connection-refused" endpoint pointed at a port nothing
-   # is listening on, e.g. http://127.0.0.1:4009/hook — no receiver needed
-   # for that one.
+```bash
+node scripts/demo-receiver.ts \
+  --port=4000 \
+  --mode=success \
+  --secret=placeholder
+```
 
-   curl -X POST http://localhost:3000/endpoints/<endpointId>/subscriptions \
-     -H 'Content-Type: application/json' -d '{"eventType":"order.completed"}'
-   ```
+**3.** Create an endpoint pointing to `http://127.0.0.1:4000/hook`, subscribe it to an event type such as `order.completed`, then publish an event through `POST /events`.
 
-4. **Publish an event**, with an `Idempotency-Key`:
+The worker will then:
 
-   ```bash
-   curl -X POST http://localhost:3000/events \
-     -H 'Content-Type: application/json' \
-     -H 'Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000' \
-     -d '{"type":"order.completed","payload":{"orderId":5821,"amount":1499}}'
-   ```
+```
+claim delivery → validate endpoint → sign payload → POST webhook
+      → record DeliveryAttempt → transition delivery state
+```
 
-   The response returns immediately (`201`) with the event id — publication
-   never waits on any receiver.
+**4.** Inspect the result:
 
-5. **Duplicate-request protection**: replay the exact same request (same
-   `Idempotency-Key`, same body) and confirm it returns `200` with the same
-   event id instead of creating a second event; then replay the same key
-   with a different body and confirm `409`.
+```http
+GET /deliveries/:deliveryId
+GET /deliveries/:deliveryId/attempts
+```
 
-6. **Observe asynchronous delivery**: poll
-   `GET /events/<eventId>/deliveries`. Within a few worker polls:
-   - the endpoint on 4000 reaches `DELIVERED` after one attempt;
-   - the endpoint on 4001 reaches `DELIVERED` after three attempts (two
-     `RETRY_SCHEDULED` failures, then success);
-   - the endpoint on 4002 reaches `FAILED` after exhausting
-     `MAX_DELIVERY_ATTEMPTS` attempts, all `RETRYABLE_FAILURE` / HTTP 500;
-   - the endpoint on 4003 reaches `FAILED` the same way, each attempt
-     categorized `TIMEOUT`;
-   - the connection-refused endpoint reaches `FAILED` the same way, each
-     attempt categorized `CONNECTION_ERROR` (`ECONNREFUSED`).
+> The demo receiver also supports deterministic failure and timeout modes for demonstrating retry handling.
 
-   Inspect each one's history with
-   `GET /deliveries/<deliveryId>` and `GET /deliveries/<deliveryId>/attempts`
-   — attempt number, outcome, HTTP status where available, duration, and
-   error category are all present.
+---
 
-7. **Signature verification**: each demo receiver's stdout logs one line per
-   request with the verification result. With the placeholder secrets from
-   step 2 it correctly reports `invalid (signature mismatch)` — the
-   endpoint's real signing secret is generated server-side and never
-   returned by the API. To see a `valid` result, read it directly from the
-   database (this is the operator's own database, not something a real
-   external receiver could do) and restart the corresponding receiver with
-   it:
+## Project Structure
 
-   ```bash
-   docker compose exec postgres psql -U webhooks -d webhooks -t -A \
-     -c "SELECT \"signingSecret\" FROM \"WebhookEndpoint\" WHERE id = '<endpointId>';"
+```
+src/
+├── app/
+│   ├── configuration
+│   ├── server assembly
+│   └── lifecycle
+│
+├── modules/
+│   ├── endpoints/
+│   ├── subscriptions/
+│   ├── events/
+│   ├── deliveries/
+│   └── metrics/
+│
+├── worker/
+│   ├── delivery claiming
+│   ├── delivery execution
+│   ├── retry policy
+│   └── lease recovery
+│
+├── infrastructure/
+│   ├── database/
+│   ├── http/
+│   ├── logging/
+│   └── security/
+│
+└── shared/
+    └── errors/
 
-   node scripts/demo-receiver.ts --port=4000 --mode=success --secret=<the secret above>
-   ```
+prisma/
+├── migrations/
+├── schema.prisma
+└── seed.ts
 
-   Publishing another event to that endpoint's subscription now logs
-   `"signature":"valid"`.
+scripts/
+├── demo-receiver.ts
+└── verify-signature.ts
 
-8. **Manual retry**: pick the `FAILED` delivery from step 6 (e.g. the 4002
-   endpoint) and retry it:
+test/
+└── unit and integration tests
+```
 
-   ```bash
-   curl -X POST http://localhost:3000/deliveries/<deliveryId>/retry
-   ```
+---
 
-   The response is `200` with `state: "PENDING"`. Because the receiver is
-   still failing, the worker re-exhausts the (reset) budget and the delivery
-   reaches `FAILED` again — `GET /deliveries/<deliveryId>/attempts` shows
-   attempt numbering continuing (e.g. 4, 5, 6) rather than restarting at 1,
-   and every prior attempt is still present. Retrying a delivery that is not
-   `FAILED` (e.g. the already-`DELIVERED` one from 4000) returns `409`;
-   retrying an unknown id returns `404`.
+## Known Limitations
 
-9. **Metrics**: `GET /metrics` reflects the fixture built above — events
-   accepted, deliveries by outcome, success rate, and average duration.
+The project intentionally remains a bounded, internship-scale backend system.
 
-10. **Swagger**: open `http://localhost:3000/docs` to browse every route,
-    request/response schema, the shared error shape, and the idempotency and
-    signing behavior described above, generated from the same route
-    definitions the server runs.
+- DNS rebinding is not detected.
+- Delivery semantics are at-least-once rather than exactly-once.
+- The application runs one worker process locally.
+- HTTP failure classification follows a project-defined policy.
+- The demo receiver is demonstration infrastructure, not a production webhook consumer.
+- There is no dedicated dashboard or frontend.
+- There is no external queue broker or distributed monitoring stack.
 
-Every step above was run against the real application and a real
-PostgreSQL database while writing this section, not merely written down and
-assumed to work.
+These constraints are deliberate — they keep the project focused on **webhook reliability, persistence, concurrency, recovery, and security** rather than infrastructure breadth.
 
-## Known limitations
+---
 
-- **DNS rebinding.** See "Endpoint safety / SSRF protections" above — the
-  URL safety module validates the literal host, not a resolved address, and
-  does not re-resolve DNS between validation and delivery.
-- **At-least-once delivery, not exactly-once.** A crash between a receiver
-  accepting a request and the platform recording the outcome can result in
-  a duplicate delivery. Receivers should deduplicate on `deliveryId`.
-- **Single-process worker.** The API and the delivery worker run in one
-  Node.js process by design — there is no multi-instance worker coordination
-  beyond the database-backed claim/lease mechanism, which does generalize to
-  multiple worker processes if that were ever needed, but only one is run
-  here.
-- **HTTP response classification.** `2xx` succeeds; `408`/`429`/any
-  `5xx`/timeouts/connection failures are retryable; every other `4xx` and
-  any `3xx` (redirects are never followed, for SSRF reasons) is a permanent
-  failure that does not consume retry budget. This is a project-level
-  implementation choice rather than a fixed protocol requirement, documented
-  here so it is not mistaken for one.
-- **`scripts/demo-receiver.ts` and `scripts/verify-signature.ts` are demo
-  scaffolding**, not a hardened reference receiver implementation — they
-  exist to make the behaviors above observable locally, and intentionally
-  stay small rather than growing into a testing framework.
+## Project Status
+
+**✅ Completed** — the implementation covers the full intended internship scope:
+
+```
+Endpoint Management → Subscriptions → Event Publication → Transactional Fan-out
+    → PostgreSQL-backed Worker → Signed HTTP Delivery → Attempt Recording
+    → Automatic Retry → Lease Recovery → Manual Retry → History & Metrics
+```
+
+| Verification | Result |
+|--------------|--------|
+| TypeScript type-check | ✅ PASS |
+| Automated tests | ✅ 135 / 135 PASS |
+| PostgreSQL migrations | ✅ PASS |
+| End-to-end demo | ✅ PASS |
+| Repository hygiene | ✅ PASS |
+
+---
+
+## Author
+
+**Muhammed Maruf Ulaş**
+Software Engineering · Student No: 230717020 · SE4001
