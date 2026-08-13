@@ -4,6 +4,7 @@ import type {
   DeliveryState,
 } from "../../../generated/prisma/client.ts";
 import type { PrismaClient } from "../../infrastructure/database/prisma.ts";
+import { InvalidStateError, NotFoundError } from "../../shared/errors/app-error.ts";
 import {
   calculateNextAttemptAt,
   isRetryBudgetExhausted,
@@ -121,19 +122,46 @@ export async function completeDeliveryWithAttempt(
       },
     });
 
-    // The budget is the number of requests that actually left the process,
-    // counted from the attempt rows (including the one just written) rather
-    // than read from Delivery.attemptCount. That column counts *claims*: a
-    // claim that never sent anything — disabled endpoint, unsafe URL, a crash
-    // before the attempt was written — still increments it, and letting a
-    // platform-side failure burn a receiver's retry budget would be wrong.
+    // The budget is the number of requests that actually left the process
+    // *during the delivery's current retry lifecycle*, counted from the
+    // attempt rows (including the one just written) rather than read from
+    // Delivery.attemptCount. That column counts *claims*: a claim that never
+    // sent anything — disabled endpoint, unsafe URL, a crash before the
+    // attempt was written — still increments it, and letting a platform-side
+    // failure burn a receiver's retry budget would be wrong.
+    //
+    // "Current lifecycle" matters because of manual retry (D4,
+    // IMPLEMENTATION_PLAN.md Part 6): `attemptBudgetFloor` is the
+    // `attemptCount` value at the moment a FAILED delivery was last manually
+    // retried back to PENDING (0 if it never was), and `attemptNumber` is
+    // exactly the `attemptCount` value the claim minted for that attempt (see
+    // the column comment on Delivery.attemptCount). Filtering to
+    // `attemptNumber > attemptBudgetFloor` therefore counts only attempts made
+    // since the most recent manual retry, so a manually retried delivery gets
+    // a fresh budget instead of immediately re-exhausting the one that already
+    // sent it to FAILED. Without this, manual retry would be inert: the very
+    // next automatic failure would see the pre-retry attempt count and fail
+    // straight back to FAILED.
+    //
     // Under READ COMMITTED this count cannot see an uncommitted attempt row
     // from a stale worker running concurrently, so the budget can overshoot by
     // at most one attempt per recovery event. That is bounded, consistent with
     // the at-least-once guarantee the platform already makes, and deliberately
     // not defended against: serializing the two would cost a heavier isolation
     // level or a lock on every completion to save one extra retry.
-    const attemptsMade = await tx.deliveryAttempt.count({ where: { deliveryId } });
+    //
+    // Reading `attemptBudgetFloor` here, inside this transaction, cannot race
+    // a concurrent manual retry: manual retry is only legal while the
+    // delivery is FAILED, and a delivery reaching this function is PROCESSING
+    // — the two are mutually exclusive by the state machine itself, so no
+    // extra locking is needed to keep this read consistent.
+    const currentDelivery = await tx.delivery.findUniqueOrThrow({
+      where: { id: deliveryId },
+      select: { attemptBudgetFloor: true },
+    });
+    const attemptsMade = await tx.deliveryAttempt.count({
+      where: { deliveryId, attemptNumber: { gt: currentDelivery.attemptBudgetFloor } },
+    });
 
     // The retry due time is written on the *database's* clock, because the
     // claim decides whether a retry is due on the database's clock
@@ -263,4 +291,90 @@ export async function failDeliveryWithoutAttempt(
   return updated.count === 1
     ? { applied: true, state: "FAILED" }
     : { applied: false, state: null };
+}
+
+/**
+ * Manual retry (SPEC.md section 11, D4, ARCHITECTURE.md section 16's
+ * `FAILED -> PENDING / RETRY_SCHEDULED` diagram). PENDING is chosen over
+ * RETRY_SCHEDULED: it is immediately claimable with no further manual action,
+ * which is exactly what SPEC.md section 11 and the Part 6 acceptance
+ * criteria ask for, and RETRY_SCHEDULED would only add a `nextAttemptAt` that
+ * would have to be set to "now" anyway.
+ *
+ * Legal only from FAILED, and guarded the same way as every other transition
+ * in this file — the WHERE clause on the actual UPDATE decides, not a value
+ * read earlier. This is not fenced on `attemptCount` like the worker-driven
+ * transitions above: FAILED is terminal for the worker (it never claims a
+ * FAILED row), so the only thing that can race this transition is a second,
+ * concurrent manual retry of the very same delivery, and the state guard
+ * below resolves that exactly like every other race here — only one caller's
+ * UPDATE can match a row that is no longer FAILED once the first commits.
+ *
+ * Resets `attemptBudgetFloor` to the delivery's current `attemptCount` (D4;
+ * see the field comment on `Delivery.attemptBudgetFloor` in schema.prisma and
+ * the budget-scoping comment in `completeDeliveryWithAttempt` above).
+ * `attemptCount` itself is never written here — it is the claim's fencing
+ * token and must stay monotonic; the next real claim mints the next value
+ * regardless of what this transition does.
+ *
+ * `completedAt` and `failureReason` are cleared because the delivery is no
+ * longer terminal and a PENDING row claiming a past `completedAt` would be
+ * self-contradictory. This erases no history: the full attempt-by-attempt
+ * record, including every past failure's detail, lives untouched in
+ * DeliveryAttempt, which this function never creates, modifies, renumbers, or
+ * deletes.
+ *
+ * Throws `NotFoundError` for an unknown delivery id and `InvalidStateError`
+ * (409) for a delivery that is not FAILED, matching the error categories the
+ * manual retry route needs (SPEC.md section 19).
+ */
+export async function manualRetryDelivery(prisma: PrismaClient, deliveryId: string): Promise<void> {
+  const current = await prisma.delivery.findUnique({
+    where: { id: deliveryId },
+    select: { state: true, attemptCount: true },
+  });
+
+  if (!current) {
+    throw new NotFoundError("Delivery not found.");
+  }
+  if (current.state !== "FAILED") {
+    throw new InvalidStateError(
+      `Delivery cannot be manually retried from state ${current.state}; only a FAILED delivery is eligible.`,
+    );
+  }
+
+  const updated = await prisma.delivery.updateMany({
+    // `attemptCount: current.attemptCount` fences this write on the same
+    // value it is about to persist into `attemptBudgetFloor` (the fencing
+    // idiom used throughout this file, e.g. `completeDeliveryWithAttempt`'s
+    // `attemptCount: attempt.attemptNumber` guard). Without it, a compound
+    // race is possible: this function reads attemptCount, then before its
+    // UPDATE runs, a second manual retry, a worker claim (attemptCount
+    // advances), and a re-failure all happen and land the row back in
+    // FAILED — at which point `state: "FAILED"` alone would still match and
+    // this call would write a stale, too-low `attemptBudgetFloor`, silently
+    // re-including an old attempt in the new lifecycle's budget (premature
+    // exhaustion) and inflating the lease-recovery stuck-delivery ceiling
+    // comparison. Fencing on `attemptCount` too makes the UPDATE match zero
+    // rows in that case, which the `count !== 1` branch below already turns
+    // into a 409 instead of a silently corrupted budget floor.
+    where: { id: deliveryId, state: "FAILED", attemptCount: current.attemptCount },
+    data: {
+      state: "PENDING",
+      attemptBudgetFloor: current.attemptCount,
+      nextAttemptAt: null,
+      completedAt: null,
+      failureReason: null,
+    },
+  });
+
+  if (updated.count !== 1) {
+    // Lost a race with another manual retry (or, in the compound case above,
+    // an intervening claim/re-failure) between the read and this statement.
+    // A legitimate outcome, reported the same way an invalid starting state
+    // is.
+    throw new InvalidStateError(
+      "Delivery state changed concurrently while retrying it; it is no longer FAILED.",
+    );
+  }
 }

@@ -67,6 +67,18 @@ import type { PrismaClient } from "../infrastructure/database/prisma.ts";
  * stuck, not retrying, so the sweep ends it in FAILED instead of returning it
  * to the queue. The allowance is deliberately generous — normal crash recovery
  * never approaches it.
+ *
+ * The claim count compared against the ceiling is `attemptCount -
+ * attemptBudgetFloor`, not raw `attemptCount` (D4, IMPLEMENTATION_PLAN.md
+ * Part 6). `attemptCount` never resets — it is the claim fencing token and
+ * must stay monotonic across the delivery's whole lifetime — but manual retry
+ * starts a new retry lifecycle, and without subtracting the floor a delivery
+ * manually retried several times could accumulate a cumulative `attemptCount`
+ * at or above the ceiling purely from *previous* lifecycles, and be
+ * spuriously abandoned as "stuck" even though it made zero stuck claims in
+ * its current one. `attemptBudgetFloor` is 0 for a delivery that has never
+ * been manually retried, so this is behaviourally identical to the raw
+ * comparison for every delivery this sweep dealt with before Part 6.
  */
 
 /**
@@ -76,8 +88,10 @@ import type { PrismaClient } from "../infrastructure/database/prisma.ts";
  * platform failed to persist an outcome this many times in a row for one
  * delivery, each time separated by a full lease period.
  *
- * (Part 6's manual retry resets the automatic-attempt budget and will need to
- * account for this counter, which only ever increases.)
+ * Compared against `attemptCount - attemptBudgetFloor` rather than raw
+ * `attemptCount` (see the module comment above): manual retry resets the
+ * automatic-attempt budget but never resets `attemptCount` itself, so the
+ * comparison has to be scoped to the delivery's current retry lifecycle.
  */
 const STUCK_DELIVERY_CLAIM_ALLOWANCE = 10;
 
@@ -129,7 +143,7 @@ export async function recoverExpiredLeases(
                FROM "Delivery"
               WHERE "state" = 'PROCESSING'
                 AND ("leaseUntil" < (now() AT TIME ZONE 'utc') OR "leaseUntil" IS NULL)
-                AND "attemptCount" >= ${ceiling}::int
+                AND ("attemptCount" - "attemptBudgetFloor") >= ${ceiling}::int
               ORDER BY "leaseUntil"
               LIMIT ${options.batchSize}::int
                 FOR UPDATE SKIP LOCKED
@@ -157,7 +171,7 @@ export async function recoverExpiredLeases(
                FROM "Delivery"
               WHERE "state" = 'PROCESSING'
                 AND ("leaseUntil" < (now() AT TIME ZONE 'utc') OR "leaseUntil" IS NULL)
-                AND "attemptCount" < ${ceiling}::int
+                AND ("attemptCount" - "attemptBudgetFloor") < ${ceiling}::int
               ORDER BY "leaseUntil"
               LIMIT ${options.batchSize}::int
                 FOR UPDATE SKIP LOCKED
