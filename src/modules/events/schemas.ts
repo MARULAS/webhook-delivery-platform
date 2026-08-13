@@ -43,6 +43,13 @@ export const publishEventBodySchema = {
 export const publishEventHeadersSchema = {
   type: "object",
   properties: {
-    "idempotency-key": { type: "string", minLength: 1, maxLength: 255 },
+    "idempotency-key": {
+      type: "string",
+      minLength: 1,
+      maxLength: 255,
+      description:
+        "Optional. Replaying the same key with an identical type/payload returns the original event (200). " +
+        "Reusing the same key for a materially different request returns 409 (idempotency conflict).",
+    },
   },
 } as const;

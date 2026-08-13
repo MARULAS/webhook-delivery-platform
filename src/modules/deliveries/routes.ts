@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { DeliveryState } from "../../../generated/prisma/client.ts";
 import type { PrismaClient } from "../../infrastructure/database/prisma.ts";
+import { errorResponseSchema } from "../../shared/errors/error-schema.ts";
 import { eventIdParamsSchema } from "../events/schemas.ts";
 import {
   deliveryIdParamsSchema,
@@ -41,10 +42,10 @@ export function registerDeliveryRoutes(app: FastifyInstance, prisma: PrismaClien
     "/events/:eventId/deliveries",
     {
       schema: {
-        description: "Lists the deliveries created for an event, one per enabled subscribed endpoint.",
+        description: "Lists the deliveries created for an event, one per enabled subscribed endpoint. 404 for an unknown event.",
         tags: ["deliveries"],
         params: eventIdParamsSchema,
-        response: { 200: listDeliveriesResponseSchema },
+        response: { 200: listDeliveriesResponseSchema, 404: errorResponseSchema },
       },
     },
     async (request) => listDeliveriesForEvent(prisma, request.params.eventId),
@@ -55,10 +56,12 @@ export function registerDeliveryRoutes(app: FastifyInstance, prisma: PrismaClien
     {
       schema: {
         description:
-          "Lists deliveries, optionally filtered by status, endpoint, or event, with bounded limit/offset pagination.",
+          "Lists deliveries, optionally filtered by status, endpoint, or event, with bounded limit/offset pagination " +
+          "(limit 1-200, default 50; offset >= 0, default 0). An unfiltered endpointId/eventId simply matches nothing " +
+          "rather than 404ing; an invalid status, limit, or offset returns 400.",
         tags: ["deliveries"],
         querystring: listDeliveriesQuerySchema,
-        response: { 200: listDeliveriesResponseSchema },
+        response: { 200: listDeliveriesResponseSchema, 400: errorResponseSchema },
       },
     },
     async (request) => {
@@ -74,7 +77,7 @@ export function registerDeliveryRoutes(app: FastifyInstance, prisma: PrismaClien
         description: "Fetches a single delivery by id.",
         tags: ["deliveries"],
         params: deliveryIdParamsSchema,
-        response: { 200: deliveryResponseSchema },
+        response: { 200: deliveryResponseSchema, 404: errorResponseSchema },
       },
     },
     async (request) => getDelivery(prisma, request.params.deliveryId),
@@ -88,7 +91,7 @@ export function registerDeliveryRoutes(app: FastifyInstance, prisma: PrismaClien
           "Lists a delivery's attempt history — outcome, HTTP status, timestamp, duration, and error category — ordered oldest first.",
         tags: ["deliveries"],
         params: deliveryIdParamsSchema,
-        response: { 200: listDeliveryAttemptsResponseSchema },
+        response: { 200: listDeliveryAttemptsResponseSchema, 404: errorResponseSchema },
       },
     },
     async (request) => listDeliveryAttempts(prisma, request.params.deliveryId),
@@ -99,10 +102,13 @@ export function registerDeliveryRoutes(app: FastifyInstance, prisma: PrismaClien
     {
       schema: {
         description:
-          "Manually retries a FAILED delivery: returns it to PENDING, resets the automatic-attempt budget, and preserves all prior attempt history. Legal only from FAILED; 409 otherwise, 404 for an unknown delivery.",
+          "Manually retries a FAILED delivery: returns it to PENDING, resets the automatic-attempt budget, and preserves " +
+          "all prior attempt history — DeliveryAttempt numbering continues rather than restarting. Legal only from FAILED " +
+          "(the only other terminal state is DELIVERED, which is not retryable); retrying from PENDING, PROCESSING, " +
+          "RETRY_SCHEDULED, or DELIVERED returns 409 and changes nothing. 404 for an unknown delivery id.",
         tags: ["deliveries"],
         params: deliveryIdParamsSchema,
-        response: { 200: deliveryResponseSchema },
+        response: { 200: deliveryResponseSchema, 404: errorResponseSchema, 409: errorResponseSchema },
       },
     },
     async (request) => retryDelivery(prisma, request.params.deliveryId),

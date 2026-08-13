@@ -13,7 +13,8 @@
     "test": "node --env-file-if-exists=.env --test --test-concurrency=1",
     "db:generate": "node --env-file-if-exists=.env node_modules/.bin/prisma generate",
     "db:migrate": "node --env-file-if-exists=.env node_modules/.bin/prisma migrate dev",
-    "db:seed": "node --env-file-if-exists=.env prisma/seed.ts"
+    "db:seed": "node --env-file-if-exists=.env prisma/seed.ts",
+    "demo:receiver": "node --env-file-if-exists=.env scripts/demo-receiver.ts"
   },
   "dependencies": {
     "@fastify/swagger": "9.8.1",
